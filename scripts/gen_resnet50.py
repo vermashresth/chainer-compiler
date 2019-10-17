@@ -4,12 +4,13 @@
 
 Usage:
 
-$ PYTHONPATH=third_party/onnx-chainer python3 scripts/gen_resnet50.py
+$ PYTHONPATH=third_party/chainer python3 scripts/gen_resnet50.py
 """
 
 import argparse
 import os
 import random
+import shutil
 import sys
 
 import numpy as np
@@ -213,14 +214,16 @@ def main_impl(args, model_cls):
 
     out_dir = 'out/backprop_test_%s' % args.arch
 
-    x = np.random.random((args.batchsize, 3, insize, insize)).astype(np.float32)
-    y = (np.random.random(args.batchsize) * 1000).astype(np.int32)
-    onehot = np.eye(1000, dtype=x.dtype)[y]
+    xp = model.xp
+    x = xp.random.random((args.batchsize, 3, insize, insize)).astype(np.float32)
+    y = (xp.random.random(args.batchsize) * 1000).astype(np.int32)
+    onehot = xp.eye(1000, dtype=x.dtype)[y]
     x = chainer.Variable(x, name='input')
     y = chainer.Variable(y, name='y')
     onehot = chainer.Variable(onehot, name='onehot')
 
     chainer.disable_experimental_feature_warning = True
+    shutil.rmtree(out_dir, ignore_errors=True)
     onnx_chainer.export_testcase(model,
                                  (x, onehot),
                                  out_dir,

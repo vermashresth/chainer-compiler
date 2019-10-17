@@ -31,6 +31,7 @@ public:
 
     void ToONNX(onnx::ValueInfoProto* xvalue) const;
     std::string DebugString() const;
+    std::string ToString() const;
 
     bool IsTemp() const {
         return kind_ == Kind::kTemp;
@@ -47,6 +48,9 @@ public:
 
     const std::string& name() const {
         return name_;
+    }
+    void ResetName(const std::string& n) {
+        name_ = n;
     }
 
     const Type& type() const {
@@ -69,16 +73,16 @@ public:
     void ResetInitializer(std::unique_ptr<Tensor>&& tensor);
     Tensor* ReleaseInitializer();
 
+    const Tensor* GetConstTensor() const;
+
+    Node* user(int index) const;
     const std::vector<Node*>& users() const {
         return users_;
     }
-    void AddUser(Node* user);
-    void DetachUser(const Node* user);
 
     Node* producer() const {
         return producer_;
     }
-    void SetProducer(Node* producer);
 
     Value* grad() const {
         return grad_;
@@ -91,6 +95,12 @@ public:
     }
 
 private:
+    friend class Graph;
+    friend class Node;
+    void SetProducer(Node* producer);
+    void AddUser(Node* user);
+    void DetachUser(const Node* user);
+
     Kind kind_{Kind::kTemp};
     std::string name_;
     std::unique_ptr<Type> type_;

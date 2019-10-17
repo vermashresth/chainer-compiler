@@ -194,8 +194,36 @@ Value* Graph::AddNullValue() {
     return AddValue("", Value::Kind::kNull);
 }
 
-Node* Graph::AddNode(Node::OpType op_type, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs, const std::string& base) {
-    Node* node = new Node(GenSym(base.empty() ? Node::OpTypeToString(op_type) : base), op_type, inputs, outputs);
+void Graph::ResetKind(Value* value) {
+    CHECK(!value->IsTemp()) << value->ToString();
+    if (value->IsInput()) {
+        auto found = std::find(input_values_.begin(), input_values_.end(), value);
+        CHECK(found != input_values_.end()) << value->ToString();
+        input_values_.erase(found);
+    }
+    if (value->IsOutput()) {
+        auto found = std::find(output_values_.begin(), output_values_.end(), value);
+        CHECK(found != output_values_.end()) << value->ToString();
+        output_values_.erase(found);
+    }
+    value->kind_ = Value::Kind::kTemp;
+    temp_values_.push_back(value);
+}
+
+Node* Graph::AddNode(
+        Node::OpType op_type,
+        const std::vector<Value*>& inputs,
+        const std::vector<Value*>& outputs,
+        const std::string& base,
+        const std::string& domain) {
+    Node* node = new Node(GenSym(base.empty() ? Node::OpTypeToString(op_type) : base), op_type, inputs, outputs, domain);
+    AddNodeImpl(std::unique_ptr<Node>(node), inputs, outputs);
+    return node;
+}
+
+Node* Graph::AddNode(
+        const onnx::NodeProto& base, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs, const std::string& name) {
+    Node* node = new Node(base, inputs, outputs, name);
     AddNodeImpl(std::unique_ptr<Node>(node), inputs, outputs);
     return node;
 }
@@ -220,10 +248,21 @@ void Graph::SortNodesTopologically() {
     nodes_.swap(next_nodes);
 }
 
+std::vector<std::pair<Value*, int>> Graph::GetTopologicallySortedValuesWithDistance() const {
+    return SortValuesTopologicallyWithDistance(GetLiveNodes(), input_values(), true);
+}
+
 std::map<Node*, int> Graph::GetNecessaryNodesAndInputCounts(const std::vector<Value*>& output_values) const {
     std::queue<Node*> q;
     for (const Value* value : output_values) {
         q.push(value->producer());
+    }
+
+    // Nodes without any outputs are always necessary (e.g., ChainerPrint).
+    for (Node* node : nodes_) {
+        if (node->outputs().empty()) {
+            q.push(node);
+        }
     }
 
     // All node in this graph for sanity check.
@@ -244,13 +283,6 @@ std::map<Node*, int> Graph::GetNecessaryNodesAndInputCounts(const std::vector<Va
         for (const Value* input : node->inputs()) {
             q.push(input->producer());
             for (Node* node : input->users()) {
-                if (node->outputs().empty()) q.push(node);
-            }
-        }
-
-        // Nodes without any outputs are always necessary (e.g., ChainerPrint).
-        for (const Value* output : node->outputs()) {
-            for (Node* node : output->users()) {
                 if (node->outputs().empty()) q.push(node);
             }
         }
@@ -313,15 +345,22 @@ void Graph::InferShapes() {
     all_values_.clear();
     nodes_.clear();
     nodes_buf_.clear();
-    std::unordered_map<std::string, int> opset_imports;
-    opset_imports[""] = 9;
-    onnx::shape_inference::InferShapes(&xgraph, opset_imports);
+    // TODO(hamaji): Probably, we can remove this try-catch by passing
+    // appropriate opset_imports.
+    try {
+        onnx::shape_inference::InferShapes(&xgraph, OpsetImports());
+    } catch (const std::runtime_error& e) {
+        std::cerr << "WARNING: Error during shape inference: " << e.what() << std::endl;
+    }
     Construct(xgraph);
 }
 
-void Graph::ResetGradients() {
+void Graph::ResetGradients(bool reset_grad_names) {
     for (const auto& v : all_values()) {
         if (Value* gv = v->grad()) {
+            if (reset_grad_names && v->IsTemp()) {
+                gv->ResetName("grad@" + v->name());
+            }
             gv->set_type(new Type(v->type()));
             v->set_grad(nullptr);
         }

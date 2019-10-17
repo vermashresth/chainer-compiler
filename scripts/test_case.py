@@ -9,11 +9,14 @@ def makedirs(d):
 class TestCase(object):
 
     def __init__(self, basedir=None, name=None, test_dir=None,
-                 rtol=None, atol=None, fail=False,
+                 rtol=None, atol=None, equal_nan=False, fail=False,
                  skip_shape_inference=False,
+                 skip_runtime_type_check=False,
+                 fixed_batch_norm=False,
                  want_gpu=False,
                  prepare_func=None,
-                 backend=None):
+                 backend=None,
+                 opset_version=None):
         assert name is not None
         self.name = name
         if basedir is None:
@@ -25,8 +28,11 @@ class TestCase(object):
 
         self.rtol = rtol
         self.atol = atol
+        self.equal_nan = equal_nan
         self.fail = fail
         self.skip_shape_inference = skip_shape_inference
+        self.skip_runtime_type_check = skip_runtime_type_check
+        self.fixed_batch_norm = fixed_batch_norm
         self.args = None
         self.is_backprop = 'backprop' in name
         self.is_backprop_two_phase = False
@@ -34,9 +40,11 @@ class TestCase(object):
         self.want_gpu = want_gpu
         self.prepare_func = prepare_func
         self.backend = backend
+        self.opset_version = opset_version
 
         self.log_dirname = self.test_dir
-        if not self.log_dirname.startswith('out'):
+        if not (self.log_dirname.startswith('out') or
+                self.log_dirname.startswith('data')):
             self.log_dirname = os.path.join('out', name)
             makedirs(self.log_dirname)
         self.log_filename = os.path.join(self.log_dirname, 'out.txt')
@@ -45,15 +53,10 @@ class TestCase(object):
         if self.prepare_func is not None:
             self.prepare_func()
 
-    def log_writer(self):
-        self.log_file = open(self.log_filename, 'wb')
-        return self.log_file
-
     def repro_cmdline(self):
         filtered = [a for a in self.args if a != '--quiet']
         return ' '.join(filtered)
 
     def log_read(self):
-        self.log_file.close()
         with open(self.log_filename, 'rb') as f:
             return f.read()

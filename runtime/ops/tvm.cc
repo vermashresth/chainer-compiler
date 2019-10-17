@@ -20,7 +20,7 @@
 
 #endif
 
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
@@ -55,6 +55,8 @@ DLDataType GetDLDataType(const chainerx::Array& array) {
             return DLDataType{kDLInt, 64, 1};
         case chainerx::Dtype::kUInt8:
             return DLDataType{kDLUInt, 8, 1};
+        case chainerx::Dtype::kFloat16:
+            return DLDataType{kDLFloat, 16, 1};
         case chainerx::Dtype::kFloat32:
             return DLDataType{kDLFloat, 32, 1};
         case chainerx::Dtype::kFloat64:
@@ -73,7 +75,7 @@ void FillDLTensor(const chainerx::Array& array, DLTensor* tensor) {
     tensor->dtype = GetDLDataType(array);
     tensor->shape = const_cast<int64_t*>(array.shape().data());
     tensor->strides = nullptr;
-    tensor->byte_offset = 0;
+    tensor->byte_offset = array.offset();
 }
 
 tvm::runtime::PackedFunc LoadPackedFunc(const std::string& dso_filename, const std::string& func_name) {
@@ -106,7 +108,7 @@ TVMOp::~TVMOp() {
 #endif
 }
 
-std::vector<chainerx::Array> TVMOp::RunImpl(chainer_compiler::runtime::XCVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
+std::vector<chainerx::Array> TVMOp::RunImpl(chainer_compiler::runtime::ChxVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
 #if CHAINER_COMPILER_ENABLE_TVM
     CHECK(!inputs.empty());
     auto& device = orig_inputs[0].device();
@@ -118,11 +120,7 @@ std::vector<chainerx::Array> TVMOp::RunImpl(chainer_compiler::runtime::XCVMState
     chainerx::Array inputs[orig_inputs.size()];
     for (size_t i = 0; i < orig_inputs.size(); ++i) {
         const chainerx::Array& input = orig_inputs[i];
-        if (input.IsContiguous()) {
-            inputs[i] = input;
-        } else {
-            inputs[i] = chainerx::Copy(input);
-        }
+        inputs[i] = chainerx::AsContiguous(input);
     }
 
     if (impl_->outputs.empty()) {

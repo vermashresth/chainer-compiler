@@ -1,14 +1,15 @@
 #include <chainerx/backprop_mode.h>
+#include <chainerx/routines/activation.h>
 #include <chainerx/routines/creation.h>
+#include <chainerx/routines/hyperbolic.h>
 #include <chainerx/routines/linalg.h>
 #include <chainerx/routines/logic.h>
 #include <chainerx/routines/manipulation.h>
-#include <chainerx/routines/math.h>
 
 #include <common/log.h>
 #include <runtime/backward_context.h>
 #include <runtime/chainerx_util.h>
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/gen_chxvm_ops.h>
 #include <runtime/ops/cudnn_rnn.h>
 
 namespace chainer_compiler {
@@ -18,7 +19,7 @@ namespace {
 
 class SequenceLengthMask {
 public:
-    SequenceLengthMask(const nonstd::optional<chainerx::Array>& sequence_lens, chainerx::Dtype dtype, int seq_length, int batch_size)
+    SequenceLengthMask(const absl::optional<chainerx::Array>& sequence_lens, chainerx::Dtype dtype, int seq_length, int batch_size)
         : batch_size_(batch_size) {
         has_mask_ = sequence_lens.has_value();
         if (!has_mask_) return;
@@ -64,13 +65,13 @@ private:
 }  // namespace
 
 std::tuple<chainerx::Array, chainerx::Array> RNNOp::RunImpl(
-        XCVMState* st,
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& w,
         const chainerx::Array& r,
-        const nonstd::optional<chainerx::Array>& b,
-        const nonstd::optional<chainerx::Array>& sequence_lens,
-        const nonstd::optional<chainerx::Array>& initial_h) {
+        const absl::optional<chainerx::Array>& b,
+        const absl::optional<chainerx::Array>& sequence_lens,
+        const absl::optional<chainerx::Array>& initial_h) {
     // X: [seq_length, batch_size, input_size]
     // W: [num_directions, hidden_size, input_size]
     // R: [num_directions, hidden_size, hidden_size]
@@ -119,13 +120,13 @@ std::tuple<chainerx::Array, chainerx::Array> RNNOp::RunImpl(
 }
 
 std::tuple<chainerx::Array, chainerx::Array> GRUOp::RunImpl(
-        XCVMState* st,
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& w,
         const chainerx::Array& r,
-        const nonstd::optional<chainerx::Array>& b,
-        const nonstd::optional<chainerx::Array>& sequence_lens,
-        const nonstd::optional<chainerx::Array>& initial_h) {
+        const absl::optional<chainerx::Array>& b,
+        const absl::optional<chainerx::Array>& sequence_lens,
+        const absl::optional<chainerx::Array>& initial_h) {
     // X: [seq_length, batch_size, input_size]
     // W: [num_directions, 3 * hidden_size, input_size]
     // R: [num_directions, 3 * hidden_size, hidden_size]
@@ -216,20 +217,20 @@ std::tuple<chainerx::Array, chainerx::Array> GRUOp::RunImpl(
     }
 }
 
-std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, XCVMOpaque*> LSTMOp::RunImpl(
-        XCVMState* st,
+std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, ChxVMOpaque*> LSTMOp::RunImpl(
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& w,
         const chainerx::Array& r,
-        const nonstd::optional<chainerx::Array>& b,
-        const nonstd::optional<chainerx::Array>& sequence_lens,
-        const nonstd::optional<chainerx::Array>& initial_h,
-        const nonstd::optional<chainerx::Array>& initial_c,
-        const nonstd::optional<chainerx::Array>& p) {
+        const absl::optional<chainerx::Array>& b,
+        const absl::optional<chainerx::Array>& sequence_lens,
+        const absl::optional<chainerx::Array>& initial_h,
+        const absl::optional<chainerx::Array>& initial_c,
+        const absl::optional<chainerx::Array>& p) {
 #if CHAINER_COMPILER_ENABLE_CUDNN
     // TODO(hamaji): Handle more cases.
     if ((direction == 0 || direction == 2) && b.has_value() && !initial_h.has_value() && !initial_c.has_value() && !p.has_value()) {
-        std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, XCVMOpaque*> result;
+        std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, ChxVMOpaque*> result;
         if (CudnnLSTM(st, x, w, r, b, sequence_lens, initial_h, initial_c, p, hidden_size, direction, &result)) {
             return result;
         }
@@ -338,7 +339,7 @@ std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, XCVMOpaque*> LSTMO
         c = chainerx::Stack({cs[0], cs[1]}, 0);
     }
 
-    if (st->options().dump_memory_usage) {
+    if (st->options().dump_memory_usage >= 1) {
         WARN_ONCE("Retained arrays for LSTM on CPU is inaccurate");
         std::vector<chainerx::Array> retained_arrays = {x, w, r, output, h, c};
         for (const auto& a : {b, sequence_lens, initial_h, initial_c, p}) {
@@ -354,7 +355,7 @@ std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, XCVMOpaque*> LSTMO
 }
 
 std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, chainerx::Array> LSTMGradOp::RunImpl(
-        XCVMState* st, const chainerx::Array& gy, const XCVMOpaque& ctx) {
+        ChxVMState* st, const chainerx::Array& gy, const ChxVMOpaque& ctx) {
 #if CHAINER_COMPILER_ENABLE_CUDNN
     {
         std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, chainerx::Array> result;

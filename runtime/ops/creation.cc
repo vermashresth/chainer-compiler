@@ -1,40 +1,65 @@
-#include <chainerx/native/native_backend.h>
 #include <chainerx/routines/creation.h>
 #include <chainerx/routines/manipulation.h>
 
 #include <common/log.h>
 #include <runtime/chainerx_util.h>
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
 
-chainerx::Array IntScalarConstantOp::RunImpl(XCVMState* st) {
-    chainerx::Device& device = host ? chainerx::GetNativeBackend().GetDevice(0) : chainerx::GetDefaultDevice();
-    return chainerx::Full({}, value, static_cast<chainerx::Dtype>(dtype), device);
+StrictScalar IntScalarConstantOp::RunImpl(ChxVMState* st) {
+    return StrictScalar(static_cast<chainerx::Dtype>(dtype), chainerx::Scalar(value), host);
 }
 
-chainerx::Array FloatScalarConstantOp::RunImpl(XCVMState* st) {
-    chainerx::Device& device = host ? chainerx::GetNativeBackend().GetDevice(0) : chainerx::GetDefaultDevice();
-    return chainerx::Full({}, value, static_cast<chainerx::Dtype>(dtype), device);
+StrictScalar FloatScalarConstantOp::RunImpl(ChxVMState* st) {
+    return StrictScalar(static_cast<chainerx::Dtype>(dtype), chainerx::Scalar(value), host);
 }
 
-chainerx::Array IntConstantOp::RunImpl(XCVMState* st) {
+class IntConstantOp::IntConstantImpl {
+public:
+    chainerx::Array cache;
+};
+
+void IntConstantOp::InitImpl() {
+    impl_ = new IntConstantImpl();
     auto make = host ? MakeHostArray : MakeArray;
     chainerx::Array a = make(chainerx::Dtype::kInt64, chainerx::Shape(shape), value.data());
-    return a.AsType(static_cast<chainerx::Dtype>(dtype));
+    impl_->cache = a.AsType(static_cast<chainerx::Dtype>(dtype));
 }
 
-chainerx::Array FloatConstantOp::RunImpl(XCVMState* st) {
+IntConstantOp::~IntConstantOp() {
+    delete impl_;
+}
+
+class FloatConstantOp::FloatConstantImpl {
+public:
+    chainerx::Array cache;
+};
+
+void FloatConstantOp::InitImpl() {
+    impl_ = new FloatConstantImpl();
     auto make = host ? MakeHostArray : MakeArray;
     chainerx::Array a = make(chainerx::Dtype::kFloat64, chainerx::Shape(shape), value.data());
-    return a.AsType(static_cast<chainerx::Dtype>(dtype));
+    impl_->cache = a.AsType(static_cast<chainerx::Dtype>(dtype));
+}
+
+FloatConstantOp::~FloatConstantOp() {
+    delete impl_;
+}
+
+chainerx::Array IntConstantOp::RunImpl(ChxVMState* st) {
+    return impl_->cache;
+}
+
+chainerx::Array FloatConstantOp::RunImpl(ChxVMState* st) {
+    return impl_->cache;
 }
 
 chainerx::Array OneHotOp::RunImpl(
-        XCVMState* st, const chainerx::Array& indices, const chainerx::Array& depth, const chainerx::Array& values) {
+        ChxVMState* st, const chainerx::Array& indices, const StrictScalar& depth, const chainerx::Array& values) {
     int rank = indices.ndim();
-    chainerx::Array depth_range = chainerx::Arange(chainerx::AsScalar(depth), indices.device());
+    chainerx::Array depth_range = chainerx::Arange(static_cast<chainerx::Scalar>(depth), indices.device());
     int axis = this->axis;
     if (axis < 0) axis += rank + 1;
 
@@ -60,7 +85,7 @@ chainerx::Array OneHotOp::RunImpl(
     return mask * (on_value + (-off_value)) + off_value;
 }
 
-chainerx::Array ConstantFillOp::RunImpl(XCVMState* st, const nonstd::optional<chainerx::Array>& input) {
+chainerx::Array ConstantFillOp::RunImpl(ChxVMState* st, const absl::optional<chainerx::Array>& input) {
     CHECK(extra_shape.empty()) << "extra_shape not implemented yet";
     chainerx::Dtype dtype = this->dtype ? static_cast<chainerx::Dtype>(this->dtype) : chainerx::Dtype::kFloat32;
     chainerx::Shape shape;
@@ -72,7 +97,7 @@ chainerx::Array ConstantFillOp::RunImpl(XCVMState* st, const nonstd::optional<ch
     return chainerx::Full(shape, value, dtype);
 }
 
-chainerx::Array EyeLikeOp::RunImpl(XCVMState* st, const chainerx::Array& input) {
+chainerx::Array EyeLikeOp::RunImpl(ChxVMState* st, const chainerx::Array& input) {
     chainerx::Dtype dtype = this->dtype ? static_cast<chainerx::Dtype>(this->dtype) : input.dtype();
     return chainerx::Eye(input.shape()[0], input.shape()[1], this->k, dtype, input.device());
 }

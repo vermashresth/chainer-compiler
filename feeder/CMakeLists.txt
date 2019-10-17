@@ -1,10 +1,8 @@
 get_filename_component(CHAINER_COMPILER_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(GOOGLETEST_INCLUDE_DIRS ${CHAINER_COMPILER_ROOT_DIR}/googletest/googletest/include)
 set(GSLLITE_INCLUDE_DIRS ${CHAINER_COMPILER_ROOT_DIR}/gsl-lite/include)
-set(OPTIONALLITE_INCLUDE_DIRS ${CHAINER_COMPILER_ROOT_DIR}/optional-lite/include)
 
 include_directories(${GSLLITE_INCLUDE_DIRS})
-include_directories(${OPTIONALLITE_INCLUDE_DIRS})
 include_directories(${CHAINER_COMPILER_ROOT_DIR})
 include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -19,20 +17,22 @@ add_library(feeder ${FEEDER_SRCS})
 set_hidden_(feeder)
 
 include_directories(${GOOGLETEST_INCLUDE_DIRS})
-add_executable(feeder_test ${FEEDER_TEST_SRCS})
-target_link_libraries(feeder_test
+add_executable(chainer_compiler_feeder_test ${FEEDER_TEST_SRCS})
+target_link_libraries(chainer_compiler_feeder_test
   feeder
   chainer_compiler_common
-  chainerx
+  ${CHAINER_COMPILER_CHAINERX_LIBRARIES}
   gtest
   gtest_main
-  pthread
+  ${CHAINER_COMPILER_PTHREAD_LIBRARIES}
   ${OpenCV_LIBS}
   ${CHAINER_COMPILER_CUDA_LIBRARIES}
+  absl::variant
+  absl::optional
   )
 
 add_test(
-  NAME feeder_test
-  COMMAND feeder_test
+  NAME chainer_compiler_feeder_test
+  COMMAND chainer_compiler_feeder_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
   )

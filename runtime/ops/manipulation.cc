@@ -3,22 +3,32 @@
 
 #include <common/log.h>
 #include <runtime/chainerx_util.h>
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
 
-chainerx::Array ShapeOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
-    return ShapeToArray(data.shape());
+chainerx::Shape ShapeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
+    return data.shape();
 }
 
-chainerx::Array SizeOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
+chainerx::Array SizeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
     int64_t size = data.GetTotalSize();
     return MakeHostArray(chainerx::Dtype::kInt64, {}, &size);
 }
 
-chainerx::Array ReshapeOp::RunImpl(XCVMState* st, const chainerx::Array& data, const chainerx::Array& shape) {
-    chainerx::Shape s{ArrayToShape(shape)};
+chainerx::Array FlattenOp::RunImpl(ChxVMState* st, const chainerx::Array& input) {
+    const int axis = ResolveAxis(input, this->axis);
+    int64_t d0 = 1;
+    int64_t d1 = 1;
+    for (size_t i = 0; i < input.shape().size(); ++i) {
+        (i < axis ? d0 : d1) *= input.shape()[i];
+    }
+    return input.Reshape({d0, d1});
+}
+
+chainerx::Array ReshapeOp::RunImpl(ChxVMState* st, const chainerx::Array& data, const chainerx::Shape& shape) {
+    chainerx::Shape s = shape;
     int from_total_size = data.GetTotalSize();
     int to_total_size = 1;
     int to_minus_one_index = -1;
@@ -40,28 +50,42 @@ chainerx::Array ReshapeOp::RunImpl(XCVMState* st, const chainerx::Array& data, c
     return chainerx::Reshape(data, s);
 }
 
-chainerx::Array ExpandOp::RunImpl(XCVMState* st, const chainerx::Array& data, const chainerx::Array& shape) {
-    return chainerx::BroadcastTo(data, ArrayToShape(shape));
+chainerx::Array ExpandOp::RunImpl(ChxVMState* st, const chainerx::Array& data, const chainerx::Shape& shape) {
+    chainerx::Shape dst_shape = chainerx::internal::BroadcastShapes(data.shape(), shape);
+    return chainerx::BroadcastTo(data, dst_shape);
 }
 
-chainerx::Array SqueezeOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
+chainerx::Array SqueezeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
     return chainerx::Squeeze(data, GetChainerXAxes(axes));
 }
 
-chainerx::Array UnsqueezeOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
+chainerx::Array UnsqueezeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
     chainerx::Shape shape = data.shape();
     for (int d : axes) {
+        d = d < 0 ? shape.size() + axes.size() + d : d;
         CHECK_LE(d, shape.size()) << "Unsqueezing axis out of bound: " << d;
         shape.insert(shape.begin() + d, 1);
     }
     return chainerx::Reshape(data, shape);
 }
 
-chainerx::Array ConcatOp::RunImpl(XCVMState* st, const std::vector<chainerx::Array>& inputs) {
+chainerx::Array ConcatOp::RunImpl(ChxVMState* st, const std::vector<chainerx::Array>& inputs) {
     return chainerx::Concatenate(inputs, axis);
 }
 
-std::vector<chainerx::Array> SplitOp::RunImpl(XCVMState* st, const chainerx::Array& input) {
+std::vector<chainerx::Array> ConcatGradOp::RunImpl(
+        ChxVMState* st, const chainerx::Array& input, const std::vector<chainerx::Array>& shape_arrays) {
+    std::vector<int64_t> lens;
+    for (const chainerx::Array& shape_array : shape_arrays) {
+        const chainerx::Shape& shape = ArrayToShape(shape_array);
+        CHECK_LT(axis, shape.size());
+        lens.push_back(shape[axis]);
+    }
+    return SplitByLengths(input, axis, lens);
+}
+
+std::vector<chainerx::Array> SplitOp::RunImpl(ChxVMState* st, const chainerx::Array& input) {
+    const int axis = ResolveAxis(input, this->axis);
     std::vector<int64_t> lens{split.begin(), split.end()};
     if (lens.empty()) {
         int64_t dim = input.shape()[axis];
@@ -72,7 +96,7 @@ std::vector<chainerx::Array> SplitOp::RunImpl(XCVMState* st, const chainerx::Arr
     return SplitByLengths(input, axis, lens);
 }
 
-chainerx::Array TransposeOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
+chainerx::Array TransposeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
     chainerx::OptionalAxes axes = GetChainerXAxes(perm);
     while (axes.has_value() && data.ndim() > axes->size()) {
         axes->push_back(axes->size());
@@ -80,17 +104,19 @@ chainerx::Array TransposeOp::RunImpl(XCVMState* st, const chainerx::Array& data)
     return chainerx::Transpose(data, axes);
 }
 
-chainerx::Array PadOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
+namespace {
+
+chainerx::Array Pad(const chainerx::Array& data, const Int64StackVector& pads, chainerx::Scalar value) {
     CHECK_EQ(data.ndim() * 2, pads.size());
     const chainerx::Shape shape = data.shape();
     chainerx::Shape new_shape = data.shape();
     std::vector<chainerx::ArrayIndex> indices1, indices2;
     for (int i = 0; i < shape.size(); ++i) {
         new_shape[i] += pads[i] + pads[i + shape.size()];
-        auto len = shape[i] + std::min(0L, pads[i]) + std::min(0L, pads[i + shape.size()]);
+        auto len = shape[i] + std::min<int64_t>(0, pads[i]) + std::min<int64_t>(0, pads[i + shape.size()]);
 
-        const auto start1 = std::max(-pads[i], 0L);
-        const auto start2 = std::max(pads[i], 0L);
+        const auto start1 = std::max<int64_t>(-pads[i], 0);
+        const auto start2 = std::max<int64_t>(pads[i], 0);
         const auto end1 = std::min(shape[i] + pads[i + shape.size()], shape[i]);
         const auto end2 = std::min(new_shape[i] - pads[i + shape.size()], new_shape[i]);
 
@@ -103,12 +129,46 @@ chainerx::Array PadOp::RunImpl(XCVMState* st, const chainerx::Array& data) {
         indices2.push_back(chainerx::Slice(start2, end2));
     }
     chainerx::Array result = chainerx::Full(new_shape, value, data.dtype(), data.device());
-    result.device().Copy(data.At(indices1), result.At(indices2));
+    BlitArray(data.At(indices1), result.At(indices2));
     return result;
 }
 
-chainerx::Array CastOp::RunImpl(XCVMState* st, const chainerx::Array& input) {
+}  // namespace
+
+chainerx::Array PadOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
+    return Pad(data, pads, value);
+}
+
+chainerx::Array DynamicPadOp::RunImpl(
+        ChxVMState* st, const chainerx::Array& data, const chainerx::Shape& pads, const absl::optional<StrictScalar>& value) {
+    chainerx::Scalar v(0.0, chainerx::GetKind(data.dtype()));
+    if (value.has_value()) {
+        v = chainerx::Scalar(*value);
+    }
+    return Pad(data, pads, v);
+}
+
+StrictScalar DtypeOp::RunImpl(ChxVMState* st, const chainerx::Array& input) {
+    return StrictScalar(chainerx::Dtype::kInt64, static_cast<int64_t>(input.dtype()), true);
+}
+
+chainerx::Array CastOp::RunImpl(ChxVMState* st, const chainerx::Array& input) {
     return CastTo(input, static_cast<chainerx::Dtype>(to));
+}
+
+chainerx::Array DynamicCastOp::RunImpl(ChxVMState* st, const chainerx::Array& input, const StrictScalar& to) {
+    return CastTo(input, static_cast<chainerx::Dtype>(static_cast<int64_t>(to)));
+}
+
+chainerx::Array PadBatchSizeOp::RunImpl(ChxVMState* st, const chainerx::Array& data) {
+    const chainerx::Shape shape = data.shape();
+    CHECK_LT(0, shape.size());
+    chainerx::Shape new_shape = shape;
+    new_shape[0] = batch_size;
+    chainerx::Array out = chainerx::Zeros(new_shape, data.dtype(), data.device());
+    const chainerx::ArrayIndex index = chainerx::Slice(0, shape[0]);
+    BlitArray(data, out.At({index}));
+    return out;
 }
 
 }  // namespace runtime

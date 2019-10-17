@@ -3,7 +3,10 @@
 #include <string>
 #include <vector>
 
+#include <chainerx/array.h>
+#include <chainerx/testing/array.h>
 #include <compiler/node.h>
+#include <compiler/onnx.h>
 
 namespace chainer_compiler {
 
@@ -27,25 +30,34 @@ public:
 
     // Creates a new operation node which has a single output. A new
     // temporary `Value` will be created if `output` is nullptr.
-    Value* Op(Node::OpType op_type, const std::vector<Value*>& inputs, Value* output = nullptr);
+    Value*
+    Op(Node::OpType op_type, const std::vector<Value*>& inputs, Value* output = nullptr, const std::string& domain = onnx::ONNX_DOMAIN);
 
     // Creates a new operation node which has multiple outputs.
-    Node* MOp(Node::OpType op_type, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs);
+    Node* MOp(
+            Node::OpType op_type,
+            const std::vector<Value*>& inputs,
+            const std::vector<Value*>& outputs,
+            const std::string& domain = onnx::ONNX_DOMAIN);
 
-    template <class T>
-    Value* Const(const Type& type, const std::vector<T>& data, Value* value = nullptr);
+    // Creates a new operation node from base onnx::NodeProto
+    Node* MOp(const onnx::NodeProto& base, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs);
 
+    Value* Const(const chainerx::Array& ary, Value* value = nullptr);
     template <class T>
-    Value* Const(const Type& type, const std::initializer_list<T>& data, Value* value = nullptr) {
-        return Const(type, std::vector<T>{data}, value);
+    Value* ScalarConst(const T& v, const Dtype& t, Value* value = nullptr) {
+        using chainerx::testing::array_detail::ArrayBuilder;
+        return Const(ArrayBuilder({}).WithData<T>({v}).Build().AsType(t.chx()), value);
     }
 
-    Value* Temp();
+    Value* Param(const chainerx::Array& ary, Value* base_value);
+
+    Value* Temp(const std::string& name_hint = "");
     Value* Temp(const Type& type);
 
     Value* Null();
 
-    std::string GenName();
+    std::string GenName(Value* value = nullptr, const std::string& hint = "");
 
 private:
     Graph* graph_;

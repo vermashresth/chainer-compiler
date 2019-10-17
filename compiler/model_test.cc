@@ -10,7 +10,7 @@
 #include <compiler/onnx.h>
 #include <onnx/shape_inference/implementation.h>
 
-#include <chainerx/context.h>
+#include <chainerx/testing/context_session.h>
 
 #include <common/log.h>
 #include <common/protoutil.h>
@@ -74,12 +74,14 @@ TEST(ModelTest, DumpSimpleONNX) {
 }
 
 TEST(ModelTest, LoadMNIST) {
+    chainerx::testing::ContextSession sess;
     std::string path = "data/mnist/model.onnx";
     onnx::ModelProto xmodel(LoadLargeProto<onnx::ModelProto>(path));
     Model model(xmodel);
 }
 
 TEST(ModelTest, DumpMNIST) {
+    chainerx::testing::ContextSession sess;
     std::string path = "data/mnist/model.onnx";
     onnx::ModelProto xmodel(LoadLargeProto<onnx::ModelProto>(path));
     Model model(xmodel);
@@ -100,14 +102,15 @@ TEST(ModelTest, DumpMNIST) {
 }
 
 TEST(ModelTest, LoadResNet50) {
-    std::string path = "data/resnet50/model.onnx";
+    chainerx::testing::ContextSession sess;
+    std::string path = "data/shufflenet/model.onnx";
     onnx::ModelProto xmodel(LoadLargeProto<onnx::ModelProto>(path));
     Model model(xmodel);
 
     EXPECT_EQ(3, model.ir_version());
     ASSERT_EQ(1, model.opset_import().size());
     EXPECT_EQ("", model.opset_import()[0].domain());
-    EXPECT_EQ(8, model.opset_import()[0].version());
+    EXPECT_EQ(9, model.opset_import()[0].version());
     EXPECT_EQ("onnx-caffe2", model.producer_name());
     EXPECT_EQ("", model.producer_version());
     EXPECT_EQ("", model.domain());
@@ -116,21 +119,21 @@ TEST(ModelTest, LoadResNet50) {
     EXPECT_EQ(0UL, model.metadata_props().size());
 
     const Graph& graph = model.graph();
-    EXPECT_EQ("resnet50", graph.name());
+    EXPECT_EQ("shufflenet", graph.name());
     EXPECT_EQ("", graph.doc_string());
-    EXPECT_EQ(270UL, graph.input_values().size());
+    EXPECT_EQ(282UL, graph.input_values().size());
     EXPECT_EQ(1UL, graph.output_values().size());
-    EXPECT_EQ(175UL, graph.temp_values().size());
-    EXPECT_EQ(176UL, graph.nodes().size());
+    EXPECT_EQ(202UL, graph.temp_values().size());
+    EXPECT_EQ(203UL, graph.nodes().size());
 }
 
 TEST(ModelTest, CompileCH2OResNet50) {
-    chainerx::Context ctx;
-    chainerx::ContextScope ctx_scope(ctx);
+    chainerx::testing::ContextSession sess;
 
     std::string path = "out/ch2o_model_Resnet_with_loss/model.onnx";
     onnx::ModelProto xmodel(LoadLargeProto<onnx::ModelProto>(path));
-    onnx::shape_inference::InferShapes(xmodel);
+    // TODO(take-cheeze): This should be allowed anytimes
+    // onnx::shape_inference::InferShapes(xmodel);
     Model model(xmodel);
     RunDefaultPasses(&model, true);
 
@@ -149,8 +152,8 @@ TEST(ModelTest, CompileCH2OResNet50) {
     EXPECT_LT(100 * 1000 * 1000, usage.param);
     EXPECT_GT(110 * 1000 * 1000, usage.param);
     // Followings could require some tweaks after some optimizations.
-    EXPECT_LT(200 * 1000 * 1000, usage.peak);
-    EXPECT_LT(500 * 1000 * 1000, usage.all);
+    EXPECT_LT(250 * 1000 * 1000, usage.peak);
+    EXPECT_LT(300 * 1000 * 1000, usage.all);
 }
 
 }  // namespace

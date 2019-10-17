@@ -1,0 +1,10 @@
+{
+    "merge": {
+        "MergePadConv": false,
+        "MergeTransposeGemm": false,
+        "MergeMatMulAdd": false
+    },
+    "simplify_preproc": {
+        "ReplaceConstant": true
+    }
+}

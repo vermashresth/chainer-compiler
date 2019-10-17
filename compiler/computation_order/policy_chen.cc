@@ -12,6 +12,7 @@
 
 #include <compiler/flags.h>
 #include <compiler/graph.h>
+#include <compiler/log.h>
 #include <compiler/node.h>
 
 namespace chainer_compiler {
@@ -72,7 +73,7 @@ std::vector<Order> ChenPolicy(const Graph& graph) {
             }
         }
         budget = budget / static_cast<int64_t>(std::sqrt(graph.nodes().size()));
-        std::cout << "Budget = " << budget / 1000000LL << " MB is used." << std::endl;
+        CLOG() << "Budget = " << budget / 1000000LL << " MB is used." << std::endl;
     }
 
     std::vector<Order> orders;
@@ -100,14 +101,9 @@ std::vector<Order> ChenPolicy(const Graph& graph) {
             sum += consumption;
         }
     }
-    for (auto s : splits) std::cout << "Split at " << s->outputs()[0]->name() << std::endl;
+    for (auto s : splits) CLOG() << "Split at " << s->ToString() << std::endl;
 
-    // schedule forward computation
-    for (Node* node : sorted) {
-        orders.emplace_back(Order::kComputeForward, node, nullptr);
-    }
-
-    // perform forgetting
+    // Determine nodes that should be retained after forward propagation
     std::map<Value*, size_t> generation;
     {
         size_t g = 0;
@@ -121,7 +117,6 @@ std::vector<Order> ChenPolicy(const Graph& graph) {
             }
         }
     }
-
     std::set<Value*> must_remember;
     {
         size_t g = 0;
@@ -142,8 +137,25 @@ std::vector<Order> ChenPolicy(const Graph& graph) {
         }
     }
 
-    for (Node* node : sorted) {
-        for (Value* value : node->outputs()) {
+    // Perform forward propagation with forgetting
+    size_t last_split = 0;
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        Node* node = sorted[i];
+        orders.emplace_back(Order::kComputeForward, node, nullptr);
+        if (std::count(splits.begin(), splits.end(), node) > 0) {
+            // split point -> perform forgetting
+            for (size_t j = last_split; j < i; ++j) {
+                for (Value* value : sorted[j]->outputs()) {
+                    if (!must_remember.count(value)) {
+                        orders.emplace_back(Order::kForgetForward, nullptr, value);
+                    }
+                }
+            }
+            last_split = i + 1;
+        }
+    }
+    for (size_t j = last_split; j < sorted.size(); ++j) {
+        for (Value* value : sorted[j]->outputs()) {
             if (!must_remember.count(value)) {
                 orders.emplace_back(Order::kForgetForward, nullptr, value);
             }
@@ -153,9 +165,9 @@ std::vector<Order> ChenPolicy(const Graph& graph) {
     // now turn to backward computation
     size_t end_index = sorted.size();
     for (int64_t i = static_cast<int64_t>(split_indices.size()) - 1; i >= -1; --i) {
-        int64_t begin_index = (i >= 0) ? static_cast<int64_t>(split_indices[i]) : 0;
+        int64_t begin_index = (i >= 0) ? (static_cast<int64_t>(split_indices[i]) + (i >= 0)) : 0;
 
-        for (int64_t j = begin_index + (i >= 0); j < end_index; ++j) {
+        for (int64_t j = begin_index; j < end_index; ++j) {
             // recomputation for [begin_index, end_index)
             bool need_recompute = false;
             for (Value* output : sorted[j]->outputs()) {

@@ -10,7 +10,7 @@ import onnx
 import onnx_script
 import test_case
 
-import gen_chainercv_test
+import gen_chainercv_op_tests
 import sentiment
 
 
@@ -476,13 +476,13 @@ def gen_sequence_test(test_name):
     inputs = [np.array(a) for a in [[1, 2], [3, 4], [5, 6]]]
     nodes = []
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceCreate',
+        'SequenceConstruct',
         inputs=[],
         outputs=['seq0']))
 
     for i, input in enumerate(inputs):
         nodes.append(onnx.helper.make_node(
-            'ChainerSequenceAppend',
+            'SequenceInsert',
             inputs=['seq%d' % i, 'in%d' % i],
             outputs=['seq%d' % (i + 1)]))
 
@@ -490,27 +490,33 @@ def gen_sequence_test(test_name):
     nodes.append(make_constant_node(
         'index', onnx.TensorProto.INT64, [index_value]))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceLookup',
+        'SequenceAt',
         inputs=['seq3', 'index'],
         outputs=['lookup_result']))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceStack',
+        'ConcatFromSequence',
         inputs=['seq3'],
-        outputs=['stack3_result']))
+        outputs=['stack3_result'],
+        axis=0,
+        new_axis=1))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceStack',
+        'ConcatFromSequence',
         inputs=['seq2'],
-        outputs=['stack2_result']))
+        outputs=['stack2_result'],
+        axis=0,
+        new_axis=1))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceConcat',
+        'ConcatFromSequence',
         inputs=['seq3'],
-        outputs=['concat3_result']))
+        outputs=['concat3_result'],
+        axis=0))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceConcat',
+        'ConcatFromSequence',
         inputs=['seq2'],
-        outputs=['concat2_result']))
+        outputs=['concat2_result'],
+        axis=0))
     nodes.append(onnx.helper.make_node(
-        'ChainerSequenceSize',
+        'SequenceLength',
         inputs=['seq3'],
         outputs=['stack3_size']))
 
@@ -537,15 +543,15 @@ def gen_sequence_pad_test(test_name):
     # TODO(hamaji): Rewrite with GraphBuilder's input/output.
     gb = onnx_script.GraphBuilder(test_name)
     inputs = [np.array(a) for a in [[1, 2, 3], [4], [5, 6]]]
-    gb.ChainerSequenceCreate(inputs=[], outputs=['seq0'])
+    gb.SequenceConstruct(inputs=[], outputs=['seq0'])
 
     for i, input in enumerate(inputs):
-        gb.ChainerSequenceAppend(inputs=['seq%d' % i, 'in%d' % i],
+        gb.SequenceInsert(inputs=['seq%d' % i, 'in%d' % i],
                                 outputs=['seq%d' % (i + 1)])
 
     index_value = 1
     index_v = gb.const([index_value])
-    gb.ChainerSequenceLookup(
+    gb.SequenceAt(
         inputs=['seq3', index_v],
         outputs=['lookup_result'])
     gb.ChainerSequencePad(
@@ -560,9 +566,11 @@ def gen_sequence_pad_test(test_name):
     gb.ChainerSequenceLengths(
         inputs=['seq3'],
         outputs=['seq3_lengths_seq'])
-    gb.ChainerSequenceStack(
+    gb.ConcatFromSequence(
         inputs=['seq3_lengths_seq'],
-        outputs=['seq3_lengths'])
+        outputs=['seq3_lengths'],
+        axis=0,
+        new_axis=1)
 
     padded = np.array([[1, 2, 3, -42], [4, -42, -42, -42], [5, 6, -42, -42]])
     outputs = [
@@ -590,25 +598,28 @@ def gen_sequence_split_test(test_name):
     inputs_v = gb.input('input', inputs)
     lengths_v = gb.input('lengths', lengths)
 
-    seq_v = gb.ChainerSequenceSeparate(inputs=[inputs_v], outputs=['seq'])
-    lengths_seq_v = gb.ChainerSequenceSeparate(inputs=[lengths_v],
-                                           outputs=['lengths_seq'])
+    seq_v = gb.SplitToSequence(inputs=[inputs_v], outputs=['seq'],
+                               keepdims=False)
+    lengths_seq_v = gb.SplitToSequence(inputs=[lengths_v],
+                                       outputs=['lengths_seq'],
+                                       keepdims=False)
     unpadded_v = gb.ChainerSequenceUnpad(inputs=[inputs_v, lengths_seq_v],
-                                        outputs=['unpadded'])
-    seq_a1_v = gb.ChainerSequenceSeparate(inputs=[inputs_v],
-                                      outputs=['seq_a1'],
-                                      axis=1)
+                                         outputs=['unpadded'])
+    seq_a1_v = gb.SplitToSequence(inputs=[inputs_v],
+                                  outputs=['seq_a1'],
+                                  axis=1,
+                                  keepdims=False)
 
     for i in range(4):
         index_v = gb.const([i], name='index_%d' % i)
         if i < 3:
-            gb.output(gb.ChainerSequenceLookup(
+            gb.output(gb.SequenceAt(
                 inputs=[seq_v, index_v],
                 outputs=['split_result_%d' % i]), inputs[i])
-            gb.output(gb.ChainerSequenceLookup(
+            gb.output(gb.SequenceAt(
                 inputs=[unpadded_v, index_v],
                 outputs=['unpad_result_%d' % i]), inputs[i][:lengths[i]])
-        gb.output(gb.ChainerSequenceLookup(
+        gb.output(gb.SequenceAt(
             inputs=[seq_a1_v, index_v],
             outputs=['split_a1_result_%d' % i]), inputs[:, i])
 
@@ -623,8 +634,8 @@ def gen_sequence_io_test(test_name):
     input_v = gb.input('input', input)
     input_seq_v = gb.input('input_seq', Seq(input_seq))
 
-    split_v = gb.ChainerSequenceSeparate([input_v])
-    stack_v = gb.ChainerSequenceStack([input_seq_v])
+    split_v = gb.SplitToSequence([input_v], keepdims=False)
+    stack_v = gb.ConcatFromSequence([input_seq_v], axis=0, new_axis=1)
 
     gb.output(gb.Identity([input_v]), input)
     gb.output(gb.Identity([input_seq_v]), Seq(input_seq))
@@ -644,7 +655,7 @@ def gen_sequence_range_test(test_name):
             input_vs.append(gb.input('input_%d' % num_inputs, arg))
             num_inputs += 1
         output_v = gb.ChainerSequenceRange(input_vs)
-        len_v = gb.ChainerSequenceSize([output_v])
+        len_v = gb.SequenceLength([output_v])
         expected = list(range(*args))
         gb.output(len_v, len(expected))
         if expected:
@@ -658,7 +669,7 @@ def gen_sequence_pop_test(test_name):
 
     inputs_v = gb.input('input', inputs)
 
-    seq_v = gb.ChainerSequenceSeparate(inputs=[inputs_v])
+    seq_v = gb.SplitToSequence(inputs=[inputs_v], keepdims=False)
     pop_count = 3
     for i in range(pop_count):
         seq_v, pop_v = gb.ChainerSequencePop(
@@ -668,12 +679,12 @@ def gen_sequence_pop_test(test_name):
         gb.output(pop_v, inputs[-1-i])
 
     # This `seq_v` is used twice, so not-optimized pass will be tested.
-    len1_v = gb.ChainerSequenceSize(inputs=[seq_v])
+    len1_v = gb.SequenceLength(inputs=[seq_v])
     seq_v, _ = gb.ChainerSequencePop(
         inputs=[seq_v],
         outputs=['seq_final', 'pop_final'],
     )
-    len2_v = gb.ChainerSequenceSize(inputs=[seq_v])
+    len2_v = gb.SequenceLength(inputs=[seq_v])
     gb.output(gb.Add(inputs=[len1_v, len2_v]),
               (len(inputs) - pop_count) * 2 - 1)
 
@@ -693,10 +704,37 @@ def gen_sequence_create_test(test_name):
     inputs = [4, 2, 3]
     inputs_v = [gb.input('input_%d' % i, input)
                 for i, input in enumerate(inputs)]
-    seq_v = gb.ChainerSequenceCreate(inputs_v)
-    stack_v = gb.ChainerSequenceStack([seq_v])
+    seq_v = gb.SequenceConstruct(inputs_v)
+    stack_v = gb.ConcatFromSequence([seq_v], axis=0, new_axis=1)
     gb.output(seq_v, Seq(inputs))
     gb.output(stack_v, np.array(inputs))
+    gb.gen_test()
+
+
+def gen_sequence_extend_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    input1 = aranges(3, 4)
+    input2 = aranges(3, 1) * 2
+    seq1 = [np.squeeze(i, 0) for i in np.split(input1, 3)]
+    seq2 = [np.squeeze(i, 0) for i in np.split(input2, 3)]
+
+    input1_v = gb.input('input1', input1)
+    input2_v = gb.input('input2', input2)
+    seq1_v = gb.SplitToSequence([input1_v], keepdims=False)
+    seq2_v = gb.SplitToSequence([input2_v], keepdims=False)
+
+    gb.output(gb.ChainerSequenceExtend([seq1_v, seq2_v]), Seq(seq1 + seq2))
+
+    gb.gen_test()
+
+
+def gen_sequence_update_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    inputs = [4, 2, 3]
+    seq_v = gb.const_seq(inputs)
+    seq_v = gb.ChainerSequenceUpdate([seq_v, gb.const(2), gb.const(42)])
+    seq_v = gb.ChainerSequenceUpdate([seq_v, gb.const(-3), gb.const(-49)])
+    gb.output(seq_v, Seq([-49, 2, 42]))
     gb.gen_test()
 
 
@@ -708,7 +746,7 @@ def gen_generic_len_test(test_name):
     len0_v = gb.ChainerGenericLen([input_v])
     reduced_v = gb.ReduceSum([input_v], axes=[0], keepdims=False)
     len1_v = gb.ChainerGenericLen([reduced_v])
-    seq_v = gb.ChainerSequenceSeparate(inputs=[input_v])
+    seq_v = gb.SplitToSequence(inputs=[input_v], keepdims=False)
     len_seq_v = gb.ChainerGenericLen([seq_v])
 
     gb.output(len0_v, input.shape[0])
@@ -725,7 +763,7 @@ def gen_generic_getitem_test(test_name):
 
     input_v = gb.input('input', input)
     reduced_v = gb.ReduceSum([input_v], axes=[0], keepdims=False)
-    seq_v = gb.ChainerSequenceSeparate(inputs=[input_v])
+    seq_v = gb.SplitToSequence(inputs=[input_v], keepdims=False)
 
     for i in range(-2, 4):
         index_v = gb.const([i])
@@ -743,7 +781,7 @@ def gen_generic_getslice_test(test_name):
 
     input_v = gb.input('input', input)
     reduced_v = gb.ReduceSum([input_v], axes=[0], keepdims=False)
-    seq_v = gb.ChainerSequenceSeparate(inputs=[input_v])
+    seq_v = gb.SplitToSequence(inputs=[input_v], keepdims=False)
 
     def get_slice(input_v, s):
         ins = [input_v]
@@ -764,9 +802,10 @@ def gen_generic_getslice_test(test_name):
         gb.output(get_slice(reduced_v, s), reduced[s])
         actual_v = get_slice(seq_v, s)
         if len(expected):
-            gb.output(gb.ChainerSequenceStack([actual_v]), expected)
+            gb.output(gb.ConcatFromSequence([actual_v], axis=0, new_axis=1),
+                      expected)
         else:
-            gb.output(gb.ChainerSequenceSize([actual_v]), 0)
+            gb.output(gb.SequenceLength([actual_v]), 0)
 
     add_test(slice(None))
     for i in range(4):
@@ -781,6 +820,19 @@ def gen_generic_getslice_test(test_name):
     gb.gen_test()
 
 
+# TODO(hamaji): Add more tests for both GetItem/SetItem.
+def gen_setitem_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    input = np.array([1, 2, 3])
+
+    input_v = gb.input('input', input)
+    output_v = gb.ChainerSetItem([input_v, gb.const(1), gb.const(42)],
+                                 slice_specs=[1])
+
+    gb.output(output_v, np.array([1, 42, 3]))
+    gb.gen_test()
+
+
 def gen_generic_add_test(test_name):
     gb = onnx_script.GraphBuilder(test_name)
     input1 = aranges(3, 4)
@@ -790,8 +842,8 @@ def gen_generic_add_test(test_name):
 
     input1_v = gb.input('input1', input1)
     input2_v = gb.input('input2', input2)
-    seq1_v = gb.ChainerSequenceSeparate([input1_v])
-    seq2_v = gb.ChainerSequenceSeparate([input2_v])
+    seq1_v = gb.SplitToSequence([input1_v], keepdims=False)
+    seq2_v = gb.SplitToSequence([input2_v], keepdims=False)
 
     gb.output(gb.ChainerGenericAdd([input1_v, input2_v]), input1 + input2)
     gb.output(gb.ChainerGenericAdd([seq1_v, seq2_v]), Seq(seq1 + seq2))
@@ -815,10 +867,10 @@ def gen_print_test(test_name):
 def gen_hello_world_test(test_name):
     gb = onnx_script.GraphBuilder(test_name)
     hello = 'Hello, world!\n'
-    out_v = gb.ChainerSequenceCreate([])
+    out_v = gb.SequenceConstruct([])
     for ch in hello:
         ch_v = gb.const(ord(ch), dtype=np.uint8)
-        out_v = gb.ChainerSequenceAppend([out_v, ch_v])
+        out_v = gb.SequenceInsert([out_v, ch_v])
     gb.output(out_v, Seq(list(np.array(ord(ch), np.uint8) for ch in hello)))
     gb.gen_test()
 
@@ -858,7 +910,6 @@ def gen_incomplete_transpose_test(test_name):
 
 
 def gen_maxpool_cover_all_test(test_name):
-    # A custom attribute for Chainer/ChainerX's `cover_all` parameter.
     gb = onnx_script.GraphBuilder(test_name)
 
     input = np.random.random((1, 3, 7, 7))
@@ -872,14 +923,14 @@ def gen_maxpool_cover_all_test(test_name):
                          outputs=['not_cover_all']),
               F.max_pooling_2d(input, ksize=3, stride=2, cover_all=False))
     gb.output(gb.MaxPool([input_v], kernel_shape=[3, 3], strides=[2, 2],
-                         chainer_cover_all=True,
+                         ceil_mode=1,
                          outputs=['cover_all']),
               F.max_pooling_2d(input, ksize=3, stride=2, cover_all=True))
     gb.output(gb.MaxPool([dynamic_v], kernel_shape=[3, 3], strides=[2, 2],
                          outputs=['not_cover_all_dynamic']),
               F.max_pooling_2d(input, ksize=3, stride=2, cover_all=False))
     gb.output(gb.MaxPool([dynamic_v], kernel_shape=[3, 3], strides=[2, 2],
-                         chainer_cover_all=True,
+                         ceil_mode=1,
                          outputs=['cover_all_dynamic']),
               F.max_pooling_2d(input, ksize=3, stride=2, cover_all=True))
 
@@ -996,9 +1047,103 @@ def gen_imagescaler_test(test_name):
 def gen_pad_negative_width_test(test_name):
     gb = onnx_script.GraphBuilder(test_name)
     v = aranges(2, 5, 6, 7)
-    gb.input('input', v)
-    gb.output(gb.Pad(['input'], pads=[0, -2, -1, -2, 0, -2, -2, -1]),
+    i_v = gb.input('input', v)
+    gb.output(gb.Pad([i_v], pads=[0, -2, -1, -2, 0, -2, -2, -1]),
               v[:, 2:-2, 1:-2, 2:-1])
+    gb.gen_test()
+
+
+def gen_pad_batch_size_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    v = aranges(2, 5, 6, 7)
+    i_v = gb.input('input', v)
+    o = np.pad(v, ((0, 6), (0, 0), (0, 0), (0, 0)), 'constant')
+    gb.output(gb.ChainerPadBatchSize([i_v], size=8), o)
+    gb.gen_test()
+
+
+def gen_const_int_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    c = np.array(list(range(20)))
+    c_v = gb.const(c)
+    gb.output(gb.Identity([c_v]), c)
+    gb.gen_test()
+
+
+def gen_const_str_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    i = 42
+    i_v = gb.input('input', i)
+    c = np.array("hoge", dtype=np.object)
+    c_v = gb.const(c)
+    gb.ChainerPrint([c_v, i_v], [])
+    gb.output(gb.Identity([i_v]), i)
+    gb.gen_test()
+
+
+def gen_const_prop_use_twice_test(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    c = np.array(list(range(20)))
+    c_v = gb.const(c)
+    gb.output(gb.Add([c_v, c_v]), c * 2)
+    gb.gen_test()
+
+
+def gen_abs_test(dtype):
+    def fn(test_name):
+        gb = onnx_script.GraphBuilder(test_name)
+        i = np.array([42, -24], dtype=dtype)
+        i_v = gb.input('input', i)
+        gb.output(gb.Abs([i_v]), np.abs(i))
+        gb.gen_test()
+    return fn
+
+
+def gen_convtranspose_bn(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+    bsize = 2
+    ichan = 3
+    ochan = 4
+    ksize = 3
+    isize = 7
+
+    x = aranges(bsize, ochan, isize, isize)
+    w = aranges(ochan, ichan, ksize, ksize) * 0.01
+    scale = aranges(ichan) * 0.1 + 1
+    bias = aranges(ichan) * 0.1 + 2
+    mean = aranges(ichan) * 0.1 + 3
+    var = aranges(ichan) * 0.1 + 4
+
+    conv = F.deconvolution_2d(x, w, pad=1, outsize=(isize, isize))
+    y = F.fixed_batch_normalization(conv, scale, bias, mean, var)
+
+    x_v = gb.input('x', x)
+    w_v = gb.param('w', w)
+    scale_v = gb.param('scale', scale)
+    bias_v = gb.param('bias', bias)
+    mean_v = gb.param('mean', mean)
+    var_v = gb.param('var', var)
+
+    conv_v = gb.ConvTranspose([x_v, w_v],
+                              kernel_shape=[ksize, ksize],
+                              pads=[1, 1, 1, 1],
+                              output_shape=[isize, isize])
+    y_v = gb.BatchNormalization([conv_v, scale_v, bias_v, mean_v, var_v])
+
+    gb.output(y_v, y)
+    gb.gen_test()
+
+
+def gen_unsqueeze_negative_axis(test_name):
+    gb = onnx_script.GraphBuilder(test_name)
+
+    x = aranges(1, 2, 3, 5)
+    y = np.expand_dims(x, axis=-2)
+
+    x_v = gb.input('x', x)
+    y_v = gb.Unsqueeze([x_v], axes=[-2])
+
+    gb.output(y_v, y)
     gb.gen_test()
 
 
@@ -1014,11 +1159,11 @@ def get_tests():
         tests.append(TestCase(name, func, **kwargs))
         if diversed:
             tests.append(TestCase(name + '_diversed', func,
-                                  backend='xcvm_test', **kwargs))
+                                  backend='chxvm_test', **kwargs))
 
     test('extra_test_negative_reshape', gen_negative_reshape_test)
 
-    test('extra_test_inf_nan', gen_inf_nan_test)
+    test('extra_test_inf_nan', gen_inf_nan_test, equal_nan=True)
 
     test('extra_test_select_item', gen_select_item_test, diversed=True)
 
@@ -1082,6 +1227,8 @@ def get_tests():
     test('extra_test_sequence_pop', gen_sequence_pop_test)
     test('extra_test_sequence_constants', gen_sequence_constants_test)
     test('extra_test_sequence_create', gen_sequence_create_test)
+    test('extra_test_sequence_extend', gen_sequence_extend_test)
+    test('extra_test_sequence_update', gen_sequence_update_test)
 
     test('extra_test_sentiment_lstm',
          sentiment.gen_rnn_sentiment_test('LSTM'), rtol=0.2)
@@ -1098,6 +1245,8 @@ def get_tests():
     test('extra_test_generic_getitem', gen_generic_getitem_test)
     test('extra_test_generic_getslice', gen_generic_getslice_test)
     test('extra_test_generic_add', gen_generic_add_test)
+
+    test('extra_test_setitem', gen_setitem_test)
 
     test('extra_test_print', gen_print_test)
     test('extra_test_hello_world', gen_hello_world_test)
@@ -1120,7 +1269,25 @@ def get_tests():
 
     test('extra_test_pad_negative_width', gen_pad_negative_width_test)
 
-    tests += gen_chainercv_test.get_tests()
+    test('extra_test_pad_batch_size', gen_pad_batch_size_test)
+
+    test('extra_test_const_int', gen_const_int_test)
+
+    test('extra_test_const_str', gen_const_str_test)
+
+    test('extra_test_const_prop_use_twice', gen_const_prop_use_twice_test)
+
+    test('extra_test_abs_int8', gen_abs_test(np.int8))
+    test('extra_test_abs_int64', gen_abs_test(np.int64))
+    test('extra_test_abs_float16', gen_abs_test(np.float16))
+
+    test('extra_test_convtranspose_bn', gen_convtranspose_bn)
+
+    # TODO(hamaji): ONNX's shape inference for Unsqueeze is probably broken.
+    test('extra_test_unsqueeze_negative_axis', gen_unsqueeze_negative_axis,
+         skip_shape_inference=True)
+
+    tests += gen_chainercv_op_tests.get_tests()
 
     return tests
 

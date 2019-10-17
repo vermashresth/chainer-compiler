@@ -2,7 +2,7 @@
 #
 # Example usage:
 #
-# $ ./scripts/elichikacheck.py elichika/tests/node/Linear.py
+# $ python3 scripts/elichikacheck.py testcases/elichika_tests/node/Linear.py
 
 import glob
 import os
@@ -16,7 +16,7 @@ def main():
         sys.stderr.write('Usage: %s test.py\n' % sys.argv[0])
         sys.exit(1)
 
-    os.environ['PYTHONPATH'] = 'elichika'
+    os.environ['PYTHONPATH'] = '.'
     py = sys.argv[1]
     tmpdir = 'out/elichika_tmp'
 

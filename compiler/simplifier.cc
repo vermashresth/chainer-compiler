@@ -3,19 +3,33 @@
 #include <iostream>
 #include <limits>
 
+#include <chainerx/array.h>
+#include <chainerx/routines/manipulation.h>
+#include <onnx/defs/schema.h>
+
 #include <common/log.h>
 #include <common/strutil.h>
-#include <compiler/config.h>
 #include <compiler/flags.h>
 #include <compiler/graph.h>
 #include <compiler/graph_builder.h>
+#include <compiler/log.h>
 #include <compiler/node.h>
 #include <compiler/value.h>
+#include <configs/backend_config.h>
 
 namespace chainer_compiler {
 namespace {
 
-typedef bool (*SimplifierFn)(Graph*, Node*);
+using chainerx::testing::array_detail::ArrayBuilder;
+
+typedef std::function<bool(Graph*, Node*)> SimplifierFn;
+
+struct Simplifier {
+    Simplifier(const char* n, SimplifierFn f) : name(n), fn(f) {
+    }
+    const char* name;
+    SimplifierFn fn;
+};
 
 bool ReplaceSum(Graph* graph, Node* node) {
     CHECK_LT(0UL, node->inputs().size());
@@ -37,7 +51,7 @@ bool ReplaceMean(Graph* graph, Node* node) {
     CHECK_EQ(1UL, node->outputs().size());
     GraphBuilder gb(graph, "SimplifyMean", node->output(0));
     Value* v = gb.Op(Node::kSum, node->inputs());
-    Value* divisor = gb.Const(Type(node->output(0)->type().dtype(), {}), {static_cast<int64_t>(node->inputs().size())});
+    Value* divisor = gb.ScalarConst<int64_t>(node->inputs().size(), node->output(0)->type().dtype());
     gb.Op(Node::kDiv, {v, divisor}, node->output(0));
     return true;
 }
@@ -50,33 +64,12 @@ bool ReplaceLess(Graph* graph, Node* node) {
     return true;
 }
 
-bool ReplaceMin(Graph* graph, Node* node) {
-    CHECK_EQ(1UL, node->outputs().size());
-    GraphBuilder gb(graph, "SimplifyMin", node->output(0));
-    std::vector<Value*> negs;
-    for (Value* v : node->inputs()) negs.push_back(gb.Op(Node::kNeg, {v}));
-    Value* r = gb.Op(Node::kMax, negs);
-    gb.Op(Node::kNeg, {r}, node->output(0));
-    return true;
-}
-
 bool ReplaceArgMin(Graph* graph, Node* node) {
     CHECK_EQ(1UL, node->inputs().size());
     CHECK_EQ(1UL, node->outputs().size());
     GraphBuilder gb(graph, "SimplifyArgMin", node->output(0));
     Value* t = gb.Op(Node::kNeg, node->inputs());
     gb.Op(Node::kArgMax, {t}, node->output(0))->producer()->set_axis(node->axis())->set_keepdims(node->keepdims());
-    return true;
-}
-
-bool ReplaceReduceMin(Graph* graph, Node* node) {
-    CHECK_EQ(1UL, node->inputs().size());
-    CHECK_EQ(1UL, node->outputs().size());
-    GraphBuilder gb(graph, "SimplifyReduceMin", node->output(0));
-    Value* t0 = gb.Op(Node::kNeg, node->inputs());
-    Value* t1 = gb.Op(Node::kReduceMax, {t0});
-    t1->producer()->set_axes(node->axes())->set_keepdims(node->keepdims());
-    gb.Op(Node::kNeg, {t1}, node->output(0));
     return true;
 }
 
@@ -89,15 +82,16 @@ bool ReplaceLpNormalization(Graph* graph, Node* node) {
     Value* n2 = gb.Op(Node::kReduceSum, {x2});
     n2->producer()->set_axes({node->axis()})->set_keepdims(true);
     Value* n = gb.Op(Node::kSqrt, {n2});
-    Value* eps = gb.Const(Type(node->output(0)->type().dtype(), {}), {1e-5});
+    Value* eps = gb.ScalarConst(1e-5, node->output(0)->type().dtype());
     Value* norm = gb.Op(Node::kAdd, {n, eps});
     gb.Op(Node::kDiv, {x, norm}, node->output(0));
     return true;
 }
 
-bool ReplaceSoftmaxCrossEntropy(Graph* graph, Node* node) {
+bool ReplaceChainerSoftmaxCrossEntropy(Graph* graph, Node* node) {
     GraphBuilder gb(graph, "SimplifySoftmaxCrossEntropy", node->output(0));
     Value* log_softmax = gb.Op(Node::kLogSoftmax, {node->input(0)});
+    log_softmax->producer()->set_chainer_is_onnx_semantics(false);
     Value* log_prob = gb.Op(Node::kChainerSelectItem, {log_softmax, node->input(1)});
     // TODO(hamaji): Just use ReduceSum for all axes and then divide
     // the result by the batch_size.
@@ -122,45 +116,40 @@ bool ReplaceConstant(Graph* graph, Node* node) {
     return true;
 }
 
-// TODO(hamaji): Revive Scan.
-#if 0
-
 bool ReplaceScan(Graph* graph, Node* scan) {
-    // Scan(seq_lens?, states..., inputs...) -> (states.. outputs...)
+    // Scan(states..., inputs...) -> (states.. outputs...)
     //  body(states..., ins...) -> (states..., outs...)
     // Loop(max_trips, cond, states...) -> (states..., outputs...)
     //  body(iter, cond, states...) -> (cond, states..., outs...)
+
+    CHECK(scan->scan_input_axes().empty());
+    CHECK(scan->scan_input_directions().empty());
+    CHECK(scan->scan_output_axes().empty());
+    CHECK(scan->scan_output_directions().empty());
+    constexpr int input_axis = 0;
+    constexpr int output_axis = 0;
 
     Graph* body = scan->body().get();
     int num_scan_inputs = scan->num_scan_inputs();
     int num_states = body->input_values().size() - num_scan_inputs;
     int num_scan_outputs = body->output_values().size() - num_states;
-    int num_sequence_lens = scan->inputs().size() - num_states - num_scan_inputs;
+
     CHECK_LT(0, num_scan_inputs);
     CHECK_LT(0, num_scan_outputs);
-    CHECK_LE(0, num_sequence_lens);
-    CHECK_GE(1, num_sequence_lens);
-    CHECK_EQ(scan->outputs().size(), num_states + num_scan_outputs);
-#if 0
-    std::cerr << "SimplifyScan:"
-              << " num_scan_inputs=" << num_scan_inputs
-              << " num_states=" << num_states
-              << " num_scan_outputs=" << num_scan_outputs
-              << " sequence_lens=" << num_sequence_lens
-              << std::endl;
-#endif
+    CHECK_EQ(scan->inputs().size(), body->input_values().size());
+    CHECK_EQ(scan->outputs().size(), body->output_values().size());
 
-    Value* sequence_lens = nullptr;
-    if (num_sequence_lens) {
-        sequence_lens = scan->input(0);
-    }
+    CLOG() << "SimplifyScan:"
+           << " num_scan_inputs=" << num_scan_inputs << " num_states=" << num_states << " num_scan_outputs=" << num_scan_outputs
+           << std::endl;
+
     std::vector<Value*> scan_input_states;
     for (int i = 0; i < num_states; ++i) {
-        scan_input_states.push_back(scan->input(i + num_sequence_lens));
+        scan_input_states.push_back(scan->input(i));
     }
     std::vector<Value*> scan_inputs;
     for (int i = 0; i < num_scan_inputs; ++i) {
-        scan_inputs.push_back(scan->input(i + num_sequence_lens + num_states));
+        scan_inputs.push_back(scan->input(i + num_states));
     }
     std::vector<Value*> scan_output_states;
     for (int i = 0; i < num_states; ++i) {
@@ -175,86 +164,99 @@ bool ReplaceScan(Graph* graph, Node* scan) {
         GraphBuilder gb(body, "SimplifyScanBody", body->output_values()[0]);
 
         Value* iter = new Value(gb.GenName(), Type(Dtype::kInt64, {}), Value::Kind::kInput);
-        Value* cond = new Value(gb.GenName(), Type(Dtype::kBool, {}), Value::Kind::kInput);
+        Value* cond_in = new Value(gb.GenName(), Type(Dtype::kBool, {}), Value::Kind::kInput);
+        Value* cond_out = new Value(gb.GenName(), Type(Dtype::kBool, {}), Value::Kind::kOutput);
+        gb.Op(Node::kIdentity, {cond_in}, cond_out);
 
-        std::vector<Value*>* mutable_inputs = body->mutable_input_values();
-        mutable_inputs->insert(mutable_inputs->begin(), cond);
-        mutable_inputs->insert(mutable_inputs->begin(), iter);
+        std::vector<Value*> new_loop_inputs = {iter, cond_in};
+        std::vector<Value*> new_loop_outputs = {cond_out};
 
-        std::vector<Value*>* mutable_outputs = body->mutable_output_values();
-        for (int i = 0; i < num_scan_inputs; ++i) {
-            Value* input = body->input_values()[2 + i + num_states];
-            // Pass slices of inputs to the original body.
-            const std::vector<Node*> users = input->users();
-            Value* input_t = gb.Op(Node::kGather, {input, iter});
-            input_t->producer()->set_axis(1);
-            for (Node* user : users) {
-                input->DetachUser(user);
-                input_t->AddUser(user);
-                user->ReplaceInput(input, input_t);
-            }
-
-            // All inputs should be carried over to the next loop.
-            Value* input_c = new Value(gb.GenName(), input->type(), Value::Kind::kOutput);
-            gb.Op(Node::kIdentity, {input}, input_c);
-            mutable_outputs->insert(mutable_outputs->begin() + num_states + i, input_c);
+        for (size_t i = 0; i < num_states; ++i) {
+            CHECK_LT(i, body->input_values().size());
+            new_loop_inputs.push_back(body->input_values()[i]);
+            CHECK_LT(i, body->output_values().size());
+            new_loop_outputs.push_back(body->output_values()[i]);
         }
 
-        Value* one = gb.Const(Type(Dtype::kBool, {}), {1});
-        Value* one_c = new Value(gb.GenName(), one->type(), Value::Kind::kOutput);
-        mutable_outputs->insert(mutable_outputs->begin(), gb.Op(Node::kIdentity, {one}, {one_c}));
+        for (size_t i = 0; i < num_scan_inputs; ++i) {
+            size_t j = i + num_states;
+            CHECK_LT(j, body->input_values().size());
+            Value* orig_input = body->input_values()[j];
+            body->ResetKind(orig_input);
+
+            Value* input_in = new Value(gb.GenName(), Type(), Value::Kind::kInput);
+            Value* input_out = new Value(gb.GenName(), Type(), Value::Kind::kOutput);
+            gb.Op(Node::kSequenceAt, {input_in, iter}, orig_input);
+            gb.Op(Node::kIdentity, {input_in}, input_out);
+
+            new_loop_inputs.push_back(input_in);
+            new_loop_outputs.push_back(input_out);
+        }
+
+        for (size_t i = 0; i < num_scan_outputs; ++i) {
+            size_t j = i + num_states;
+            CHECK_LT(j, body->output_values().size());
+            Value* orig_output = body->output_values()[j];
+            body->ResetKind(orig_output);
+
+            Value* output_in = new Value(gb.GenName(), Type(), Value::Kind::kInput);
+            Value* output_out = new Value(gb.GenName(), Type(), Value::Kind::kOutput);
+            gb.Op(Node::kSequenceInsert, {output_in, orig_output}, output_out);
+
+            new_loop_inputs.push_back(output_in);
+            new_loop_outputs.push_back(output_out);
+        }
+
+        *body->mutable_input_values() = new_loop_inputs;
+        *body->mutable_output_values() = new_loop_outputs;
     }
 
     {
         GraphBuilder gb(graph, "SimplifyScan", scan->output(0));
-        Value* zero = gb.Const(Type(Dtype::kInt64, {}), {0});
-        Value* one = gb.Const(Type(Dtype::kInt64, {}), {1});
-        Value* one_vec = gb.Const(Type(Dtype::kInt64, {1}), {1});
-        // Calcuate the number of trips.
-        // TODO(hamaji): Better to check if all inputs have the same length.
-        std::vector<Value*> lengths;
-        if (sequence_lens) {
-            lengths.push_back(gb.Op(Node::kReduceMax, {sequence_lens}));
-        }
-        Value* batch_size = nullptr;
-        for (Value* input : scan_inputs) {
-            Value* shape = gb.Op(Node::kShape, {input});
-            Value* len = gb.Op(Node::kGather, {shape, one});
-            lengths.push_back(len);
-            if (!batch_size) {
-                batch_size = gb.Op(Node::kGather, {shape, zero});
-            }
-        }
-        Value* max_trips = gb.Op(Node::kMax, lengths);
 
-        std::vector<Value*> loop_inputs = {max_trips, one};
-        for (Value* value : scan_input_states) {
-            Value* shape = gb.Op(Node::kShape, {value});
-            Value* unsqueezed = gb.Op(Node::kUnsqueeze, {value});
-            unsqueezed->producer()->set_axes({0});
-            Value* bs = gb.Op(Node::kReshape, {batch_size, one_vec});
-            Value* new_shape = gb.Op(Node::kConcat, {bs, shape});
-            Value* expanded = gb.Op(Node::kExpand, {unsqueezed, new_shape});
-            loop_inputs.push_back(expanded);
+        std::vector<Value*> input_seqs;
+        for (Value* v : scan_inputs) {
+            Value* inputs = gb.Op(Node::kSplitToSequence, {v});
+            inputs->producer()->set_axis(input_axis)->set_keepdims(false);
+            input_seqs.push_back(inputs);
         }
-        for (Value* value : scan_inputs) loop_inputs.push_back(value);
+
+        std::vector<Value*> loop_inputs;
+        Value* max_trips = gb.Op(Node::kSequenceLength, {input_seqs.front()});
+        loop_inputs.push_back(max_trips);
+        loop_inputs.push_back(gb.Null());
+
+        for (Value* v : scan_input_states) {
+            loop_inputs.push_back(v);
+        }
+        for (Value* v : input_seqs) {
+            loop_inputs.push_back(v);
+        }
+        for (Value* v : scan_outputs) {
+            (void)v;
+            loop_inputs.push_back(gb.Op(Node::kSequenceConstruct, {}));
+        }
 
         std::vector<Value*> loop_outputs;
-        for (Value* value : scan_output_states) loop_outputs.push_back(value);
-        // All inputs are appended as loop states.
-        for (int i = 0; i < num_scan_inputs; ++i) loop_outputs.push_back(gb.Temp());
-        std::vector<Value*> loop_scan_outputs;
-        for (Value* value : scan_outputs) loop_outputs.push_back(value);
+        for (Value* v : scan_output_states) {
+            loop_outputs.push_back(v);
+        }
+        for (Value* v : scan_inputs) {
+            (void)v;
+            loop_outputs.push_back(gb.Null());
+        }
+        for (Value* v : scan_outputs) {
+            Value* outputs = gb.Temp();
+            loop_outputs.push_back(outputs);
+            gb.Op(Node::kConcatFromSequence, {outputs}, v)->producer()->set_axis(output_axis)->set_new_axis(true);
+        }
 
         Node* loop = gb.MOp(Node::kLoop, loop_inputs, loop_outputs);
         loop->set_body(scan->release_body());
-        loop->set_chainer_stack_axis(1);
     }
 
     return true;
 }
-
-#endif
 
 void ReplaceGlobalPool(Graph* graph, Node* node, Node::OpType new_op, const std::string& name) {
     CHECK_EQ(1, node->inputs().size()) << name;
@@ -278,7 +280,17 @@ bool ReplaceGlobalAveragePool(Graph* graph, Node* node) {
 bool ReplaceFlatten(Graph* graph, Node* node) {
     CHECK_EQ(1, node->inputs().size());
     const Type& type = node->input(0)->type();
-    CHECK(type.HasKnownShape()) << "The input shape of Flatten must be known";
+
+    // Fallback to dynamic reshape when input is unknown shape
+    if (!type.HasKnownShape()) {
+        return false;
+    }
+
+    // TODO(hamaji): Maybe better to simplify negative flatten here.
+    if (node->axis() < 0) {
+        return false;
+    }
+
     CHECK_LT(1, type.dims().size()) << "The input of Flatten must have at least 2 dimensions";
     GraphBuilder gb(graph, "SimplifyFlatten", node->output(0));
     int64_t d0 = 1;
@@ -286,7 +298,7 @@ bool ReplaceFlatten(Graph* graph, Node* node) {
     for (size_t i = 0; i < type.dims().size(); ++i) {
         (i < node->axis() ? d0 : d1) *= type.dims()[i];
     }
-    Value* shape = gb.Const(Type(Dtype::kInt64, {2}), {d0, d1});
+    Value* shape = gb.Const(ArrayBuilder({2}).WithData<int64_t>({d0, d1}).Build());
     gb.Op(Node::kReshape, {node->input(0), shape}, node->output(0));
     return true;
 }
@@ -322,68 +334,24 @@ bool ReplaceReduceLogSumExp(Graph* graph, Node* node) {
     return true;
 }
 
-bool ReplaceSoftplus(Graph* graph, Node* node) {
-    GraphBuilder gb(graph, "SimplifySoftplus", node->output(0));
-    Value* v0 = gb.Op(Node::kExp, node->inputs());
-    Value* one = gb.Const(Type(node->input(0)->type().dtype(), {}), {1});
-    Value* v1 = gb.Op(Node::kAdd, {v0, one});
-    gb.Op(Node::kLog, {v1}, node->output(0));
+bool ReplaceChainerReduceSumTo(Graph* graph, Node* node) {
+    const Type& in_type = node->input(0)->type();
+    const Type& out_type = node->output(0)->type();
+    if (!in_type.HasKnownShape() || !out_type.HasKnownShape() || in_type.dims() != out_type.dims()) {
+        return false;
+    }
+
+    GraphBuilder gb(graph, "SimplifyReduceSumTo", node->output(0));
+    gb.Op(Node::kIdentity, {node->input(0)}, node->output(0));
     return true;
 }
 
 bool ReplaceSoftsign(Graph* graph, Node* node) {
     GraphBuilder gb(graph, "SimplifySoftsign", node->output(0));
     Value* v0 = gb.Op(Node::kAbs, node->inputs());
-    Value* one = gb.Const(Type(node->input(0)->type().dtype(), {}), {1});
+    Value* one = gb.ScalarConst(1, node->input(0)->type().dtype());
     Value* v1 = gb.Op(Node::kAdd, {v0, one});
     gb.Op(Node::kDiv, {node->input(0), v1}, node->output(0));
-    return true;
-}
-
-bool ReplaceConv(Graph* graph, Node* node) {
-    CHECK_LT(0, node->group());
-    if (node->group() == 1) return false;
-    GraphBuilder gb(graph, "SimplifyConvGroup", node->output(0));
-
-    // Split the input.
-    std::vector<Value*> inputs;
-    for (int i = 0; i < node->group(); ++i) {
-        inputs.push_back(gb.Temp());
-    }
-    gb.MOp(Node::kSplit, {node->input(0)}, inputs)->set_axis(1);
-
-    std::vector<Value*> weights;
-    for (int i = 0; i < node->group(); ++i) {
-        weights.push_back(gb.Temp());
-    }
-    gb.MOp(Node::kSplit, {node->input(1)}, weights)->set_axis(0);
-
-    std::vector<Value*> biases;
-    if (node->inputs().size() >= 3) {
-        for (int i = 0; i < node->group(); ++i) {
-            biases.push_back(gb.Temp());
-        }
-        gb.MOp(Node::kSplit, {node->input(2)}, biases)->set_axis(0);
-    }
-
-    std::vector<Value*> outputs;
-    for (int i = 0; i < node->group(); ++i) {
-        std::vector<Value*> ins = {inputs[i], weights[i]};
-        if (!biases.empty()) {
-            ins.push_back(biases[i]);
-        }
-        Value* conv = gb.Op(Node::kConv, ins);
-        conv->producer()
-                ->set_auto_pad(node->auto_pad())
-                ->set_dilations(node->dilations())
-                ->set_kernel_shape(node->kernel_shape())
-                ->set_pads(node->pads())
-                ->set_strides(node->strides());
-        outputs.push_back(conv);
-    }
-
-    gb.Op(Node::kConcat, outputs, node->output(0))->producer()->set_axis(1);
-
     return true;
 }
 
@@ -419,7 +387,7 @@ bool ReplaceMaxPool(Graph* graph, Node* node) {
     Value* padded = PadForPool(&gb, node, -std::numeric_limits<double>::infinity());
     gb.Op(Node::kMaxPool, {padded}, node->output(0))
             ->producer()
-            ->set_chainer_cover_all(node->chainer_cover_all())
+            ->set_ceil_mode(node->ceil_mode())
             ->set_auto_pad(node->auto_pad())
             ->set_kernel_shape(node->kernel_shape())
             ->set_storage_order(node->storage_order())
@@ -440,16 +408,6 @@ bool ReplaceAveragePool(Graph* graph, Node* node) {
             ->set_kernel_shape(node->kernel_shape())
             ->set_storage_order(node->storage_order())
             ->set_strides(node->strides());
-    return true;
-}
-
-bool ReplaceConcat(Graph* graph, Node* node) {
-    GraphBuilder gb(graph, "SimplifyConcat", node->output(0));
-    Value* seq = gb.Op(Node::kChainerSequenceCreate, {});
-    for (Value* v : node->inputs()) {
-        seq = gb.Op(Node::kChainerSequenceAppend, {seq, v});
-    }
-    gb.Op(Node::kChainerSequenceConcat, {seq}, node->output(0))->producer()->set_axis(node->axis());
     return true;
 }
 
@@ -502,6 +460,9 @@ bool ReplaceConstantOfShape(Graph* graph, Node* node) {
             case Dtype::kUInt8:
                 op->set_value(tensor->Get<uint8_t>(0));
                 break;
+            case Dtype::kFloat16:
+                op->set_value(static_cast<float>(tensor->Get<chainerx::Float16>(0)));
+                break;
             case Dtype::kFloat32:
                 op->set_value(tensor->Get<float>(0));
                 break;
@@ -526,28 +487,38 @@ bool ReplaceShape(Graph* graph, Node* node) {
     }
 
     GraphBuilder gb(graph, "SimplifyShape", node->output(0));
-    Value* shape = gb.Const(Type(Dtype::kInt64, {static_cast<int64_t>(typ.dims().size())}), typ.dims());
+    Value* shape = gb.Const(ArrayBuilder({static_cast<int64_t>(typ.dims().size())}).WithData<int64_t>(typ.dims()).Build());
     gb.Op(Node::kIdentity, {shape}, node->output(0));
     return true;
 }
 
-bool RemoveIdentity(Graph* graph, Node* node) {
+bool ReplaceIdentity(Graph* graph, Node* node) {
     Value* input = node->input(0);
     Value* output = node->output(0);
     if (!input->IsTemp() || !output->IsTemp()) return false;
-    for (Node* user : output->users()) {
-        input->AddUser(user);
+    for (Node* user : std::vector<Node*>(output->users())) {
         user->ReplaceInput(output, input);
     }
     return true;
 }
 
-bool ReplaceSelectItem(Graph* graph, Node* node) {
+bool ReplaceConcat(Graph* graph, Node* node) {
+    // Replace nop concat
+    if (node->inputs().size() == 1 && node->outputs().size() == 1) {
+        return ReplaceIdentity(graph, node);
+    }
+
+    return false;
+}
+
+using chainerx::testing::array_detail::ArrayBuilder;
+
+bool ReplaceChainerSelectItem(Graph* graph, Node* node) {
     GraphBuilder gb(graph, "SimplifySelectItem", node->output(0));
     Value* x = node->input(0);
-    Value* values = gb.Const(Type(x->type().dtype(), {2}), {0.0, 1.0});
+    Value* values = gb.Const(ArrayBuilder({2}).WithData<double>({0.0, 1.0}).Build().AsType(x->type().dtype().chx()));
     Value* shape = gb.Op(Node::kShape, {x});
-    Value* one = gb.Const(Type(Dtype::kInt64, {}), {1});
+    Value* one = gb.ScalarConst(1, Dtype::kInt64);
     Value* num_classes = gb.Op(Node::kGather, {shape, one});
     num_classes = gb.Op(Node::kUnsqueeze, {num_classes});
     num_classes->producer()->set_axes({0});
@@ -562,34 +533,58 @@ bool ReplaceSelectItem(Graph* graph, Node* node) {
     return true;
 }
 
-bool ReplaceLinear(Graph* graph, Node* node) {
+bool ReplaceChainerLinear(Graph* graph, Node* node) {
     GraphBuilder gb(graph, "SimplifyLinear", node->output(0));
     Value* x = node->input(0);
     Value* x_shape = gb.Op(Node::kShape, {x});
-    Value* zero = gb.Const(Type(Dtype::kInt64, {}), {0});
-    Value* batch_size = gb.Op(Node::kGather, {x_shape, zero});
-    batch_size = gb.Op(Node::kUnsqueeze, {batch_size});
-    batch_size->producer()->set_axes({0});
-    Value* neg_one = gb.Const(Type(Dtype::kInt64, {1}), {-1});
+
+    Value* batch_size = nullptr;
+    std::vector<Value*> dims;
+    for (int i = 0; i < node->n_batch_axes(); ++i) {
+        Value* axis = gb.ScalarConst(i, Dtype::kInt64);
+        Value* dim = gb.Op(Node::kGather, {x_shape, axis});
+        dim = gb.Op(Node::kUnsqueeze, {dim});
+        dim->producer()->set_axes({0});
+        dims.push_back(dim);
+        if (batch_size) {
+            batch_size = gb.Op(Node::kMul, {batch_size, dim});
+        } else {
+            batch_size = dim;
+        }
+    }
+    CHECK(batch_size) << node->DebugString();
+    Value* neg_one = gb.Const(ArrayBuilder({1}).WithData<int64_t>({-1}).Build());
     Value* mat_shape = gb.Op(Node::kConcat, {batch_size, neg_one});
     mat_shape->producer()->set_axis(0);
     x = gb.Op(Node::kReshape, {x, mat_shape});
 
     Value* w = node->input(1);
+    Value* output = nullptr;
     if (node->inputs().size() == 2) {
         Value* wt = gb.Op(Node::kTranspose, {w});
-        gb.Op(Node::kMatMul, {x, wt}, node->output(0));
+        output = gb.Op(Node::kMatMul, {x, wt});
     } else {
-        gb.Op(Node::kGemm, {x, w, node->input(2)}, node->output(0))->producer()->set_trans_a(false)->set_trans_b(true);
+        output = gb.Op(Node::kGemm, {x, w, node->input(2)});
+        output->producer()->set_trans_a(false)->set_trans_b(true);
     }
+
+    if (node->n_batch_axes() == 1) {
+        gb.Op(Node::kIdentity, {output}, node->output(0));
+    } else {
+        dims.push_back(neg_one);
+        Value* y_shape = gb.Op(Node::kConcat, dims);
+        y_shape->producer()->set_axis(0);
+        gb.Op(Node::kReshape, {output, y_shape}, node->output(0));
+    }
+
     return true;
 }
 
 bool ReplaceImageScaler(Graph* graph, Node* node) {
     GraphBuilder gb(graph, "SimplifyImageScaler", node->output(0));
-    Value* scale = gb.Const(Type(Dtype::kFloat32, {}), {node->scale()});
+    Value* scale = gb.ScalarConst(node->scale(), Dtype::kFloat32);
     Value* scaled = gb.Op(Node::kMul, {node->input(0), scale});
-    Value* biases = gb.Const(Type(Dtype::kFloat32, {static_cast<int64_t>(node->bias_list().size())}), node->bias_list());
+    Value* biases = gb.Const(ArrayBuilder({static_cast<int64_t>(node->bias_list().size())}).WithData<float>(node->bias_list()).Build());
     biases = gb.Op(Node::kUnsqueeze, {biases});
     biases->producer()->set_axes({0, 2, 3});
     gb.Op(Node::kAdd, {scaled, biases}, node->output(0));
@@ -628,90 +623,274 @@ bool ReplaceMaxRoiPool(Graph* graph, Node* node) {
     return true;
 }
 
-void ReplaceInitializers(Graph* graph) {
-    std::map<Value*, Value*> initializers;
-    for (Value* value : graph->input_values()) {
-        if (!value->initializer()) {
-            continue;
-        }
+bool ReplaceSplit(Graph* graph, Node* node) {
+    GraphBuilder gb(graph, "SimplifySplit", node->output(0));
+    Value* input = node->input(0);
+    CHECK(input->type().HasKnownShape()) << input->ToString();
+    int axis = node->axis();
+    CHECK_LT(axis, input->type().ndim());
 
-        GraphBuilder gb(graph, "SimplifyInitializers", value);
-        Value* replaced = gb.Op(Node::kConstant, {});
-        replaced->producer()->set_tensor_value(value->ReleaseInitializer());
-        CHECK(initializers.emplace(value, replaced).second);
-    }
-
-    for (const auto& p : initializers) {
-        Value* value = p.first;
-        Value* replaced = p.second;
-        for (Node* node : std::vector<Node*>(value->users())) {
-            value->DetachUser(node);
-            replaced->AddUser(node);
-            node->ReplaceInput(value, replaced);
+    std::vector<int64_t> split(node->split());
+    if (split.empty()) {
+        int dim = input->type().dims()[axis];
+        CHECK_EQ(0, dim % node->outputs().size());
+        for (size_t i = 0; i < node->outputs().size(); ++i) {
+            split.push_back(dim / node->outputs().size());
         }
     }
+
+    CHECK_EQ(node->outputs().size(), split.size());
+    int64_t start = 0;
+    for (size_t i = 0; i < node->outputs().size(); ++i) {
+        int64_t end = start + split[i];
+        Value* output = node->output(i);
+        gb.Op(Node::kSlice, {input}, output)->producer()->set_axes({axis})->set_starts({start})->set_ends({end});
+        start = end;
+    }
+    return true;
+}
+
+bool ReplaceQLinearMatMul(Graph* graph, Node* node) {
+    GraphBuilder gb(graph, "SimplifyQLinearMatMul", node->output(0));
+
+    Value* a = node->input(0);
+    Value* a_scale = node->input(1);
+    Value* a_zero_point = node->input(2);
+    Value* b = node->input(3);
+    Value* b_scale = node->input(4);
+    Value* b_zero_point = node->input(5);
+    Value* y_scale = node->input(6);
+    Value* y_zero_point = node->input(7);
+
+    Value* a_dl = gb.Op(Node::kDequantizeLinear, {a, a_scale, a_zero_point});
+    Value* b_dl = gb.Op(Node::kDequantizeLinear, {b, b_scale, b_zero_point});
+    Value* mm = gb.Op(Node::kMatMul, {a_dl, b_dl});
+
+    gb.Op(Node::kQuantizeLinear, {mm, y_scale, y_zero_point}, node->output(0));
+
+    return true;
+}
+
+bool ReplaceResizeForDldt(Graph* graph, Node* node) {
+    if (node->inputs().size() != 2) {
+        return false;
+    }
+
+    GraphBuilder gb(graph, "SimplifyResizeForDldt", node->output(0));
+
+    const Tensor* scales_tensor = node->input(1)->GetConstTensor();
+    CHECK(scales_tensor);
+    const chainerx::Array& a = scales_tensor->chx();
+    CHECK_EQ(chainerx::Shape({4}), a.shape());
+    std::vector<double> scales;
+    for (int64_t i = 0; i < a.GetTotalSize(); ++i) {
+        scales.emplace_back(chainerx::AsScalar(a.At({i})));
+    }
+    CHECK_EQ(4, scales.size());
+    CHECK_EQ(1, scales[0]);
+    CHECK_EQ(1, scales[1]);
+    CHECK_EQ(scales[2], scales[3]);
+
+    // Use chainer domain to disable shape inference. Otherwise,
+    // ONNX's shape inference will access the second input.
+    gb.MOp(Node::kUpsample, {node->input(0)}, node->outputs(), CHAINER_ONNX_DOMAIN)
+            ->set_mode(node->mode())
+            ->set_height_scale(scales[2])
+            ->set_width_scale(scales[3]);
+    return true;
+}
+
+bool ReplaceSequenceEmpty(Graph* graph, Node* node) {
+    GraphBuilder gb(graph, "SimplifySequenceEmpty", node->output(0));
+    gb.Op(Node::kSequenceConstruct, {}, node->output(0));
+    return true;
+}
+
+bool ReplaceClip(Graph* graph, Node* node) {
+    // No need to upgrade to Clip-11.
+    if (node->inputs().size() > 1) {
+        return false;
+    }
+    GraphBuilder gb(graph, "SimplifyClip", node->output(0));
+    Dtype dtype = node->input(0)->type().dtype();
+    CHECK_NE(Dtype::kUnknown, dtype);
+    Value* min = gb.ScalarConst(node->min(), dtype);
+    Value* max = gb.ScalarConst(node->max(), dtype);
+    gb.Op(Node::kClip, {node->input(0), min, max}, node->output(0));
+    return true;
+}
+
+bool ReplaceTopK(Graph* graph, Node* node) {
+    if (node->inputs().size() == 2) {
+        return false;
+    }
+
+    // TopK-1 to TopK-10
+    CHECK(node->k() > 0);
+    GraphBuilder gb(graph, "SimplifyTopK", node->output(0));
+    Value* k = gb.ScalarConst(node->k(), Dtype::kInt64);
+    gb.MOp(Node::kTopK, {node->input(0), k}, node->outputs())->set_axis(node->axis());
+
+    return true;
+}
+
+bool ReplaceUpsample(Graph* graph, Node* node) {
+    if (node->inputs().size() == 2) {
+        // TODO(take-cheeze): Canonicalize to Resize op
+        return false;
+    }
+
+    // Upsample-7 to Resize-10
+    CHECK(node->scales().size() > 0);
+    GraphBuilder gb(graph, "SimplifyUpsample", node->output(0));
+    Value* scales = gb.Const(ArrayBuilder({static_cast<int64_t>(node->scales().size())}).WithData<float>(node->scales()).Build());
+    gb.MOp(Node::kResize, {node->input(0), scales}, node->outputs())->set_mode(node->mode());
+
+    return true;
+}
+
+SimplifierFn FunctionExpander(const std::string& fn, const onnx::OpSchema* schema) {
+    return [fn, schema](Graph* graph, Node* fn_nd) {
+        std::unordered_map<std::string, Value*> value_table;
+        for (size_t i = 0; i < schema->inputs().size(); ++i) {
+            value_table.insert(std::make_pair(schema->inputs()[i].GetName(), fn_nd->input(i)));
+        }
+        for (size_t i = 0; i < schema->outputs().size(); ++i) {
+            value_table.insert({schema->outputs()[i].GetName(), fn_nd->output(i)});
+        }
+
+        GraphBuilder gb(graph, "Expand" + fn, fn_nd->output(0));
+        onnx::NodeProto onnx_fn_nd;
+        fn_nd->ToONNX(&onnx_fn_nd);
+
+        for (const onnx::NodeProto& src_nd : schema->GetFunction()->node()) {
+            // Map inputs/outputs
+            std::vector<Value*> in_vals, out_vals;
+            for (const std::string& i : src_nd.input()) {
+                Value*& v = value_table[i];
+                if (!v) {
+                    v = gb.Temp(i);
+                }
+                in_vals.push_back(v);
+            }
+            for (const std::string& o : src_nd.output()) {
+                Value*& v = value_table[o];
+                if (!v) {
+                    v = gb.Temp(o);
+                }
+                out_vals.push_back(v);
+            }
+
+            // Expand attribute references
+            std::unique_ptr<onnx::NodeProto> ref_extracted;
+            for (size_t attr_idx = 0; attr_idx < src_nd.attribute().size(); ++attr_idx) {
+                const onnx::AttributeProto& attr = src_nd.attribute(attr_idx);
+                if (!attr.has_ref_attr_name()) {
+                    continue;
+                }
+
+                if (!ref_extracted) {
+                    ref_extracted = std::make_unique<onnx::NodeProto>(src_nd);
+                }
+                const onnx::AttributeProto* ex_attr = nullptr;
+                for (const onnx::AttributeProto& func_attr : onnx_fn_nd.attribute()) {
+                    if (func_attr.name() == attr.ref_attr_name()) {
+                        ex_attr = &func_attr;
+                        break;
+                    }
+                }
+                auto default_attr_it = schema->attributes().find(attr.ref_attr_name());
+                if (default_attr_it != schema->attributes().end()) {
+                    ex_attr = &default_attr_it->second.default_value;
+                }
+                CHECK(ex_attr) << "attribute reference not found: " << attr.ref_attr_name();
+                *ref_extracted->mutable_attribute(attr_idx) = *ex_attr;
+            }
+
+            // Expand node to graph
+            gb.MOp(ref_extracted ? *ref_extracted : src_nd, in_vals, out_vals);
+        }
+        return true;
+    };
 }
 
 }  // namespace
 
-void Simplify(const CompilerConfig& ccfg, Graph* graph, bool gen_backprop) {
-    std::map<Node::OpType, SimplifierFn> simplifiers;
-    CHECK(simplifiers.emplace(Node::kSum, ReplaceSum).second);
-    CHECK(simplifiers.emplace(Node::kLess, ReplaceLess).second);
-    CHECK(simplifiers.emplace(Node::kMin, ReplaceMin).second);
-    CHECK(simplifiers.emplace(Node::kArgMin, ReplaceArgMin).second);
-    CHECK(simplifiers.emplace(Node::kReduceMin, ReplaceReduceMin).second);
-    CHECK(simplifiers.emplace(Node::kLpNormalization, ReplaceLpNormalization).second);
-    CHECK(simplifiers.emplace(Node::kChainerSoftmaxCrossEntropy, ReplaceSoftmaxCrossEntropy).second);
-    // TODO(hamaji): Revive Scan.
-    // CHECK(simplifiers.emplace(Node::kScan, ReplaceScan).second);
-    CHECK(simplifiers.emplace(Node::kGlobalMaxPool, ReplaceGlobalMaxPool).second);
-    CHECK(simplifiers.emplace(Node::kGlobalAveragePool, ReplaceGlobalAveragePool).second);
-    CHECK(simplifiers.emplace(Node::kFlatten, ReplaceFlatten).second);
-    CHECK(simplifiers.emplace(Node::kMean, ReplaceMean).second);
-    CHECK(simplifiers.emplace(Node::kReduceL1, ReplaceReduceL1).second);
-    CHECK(simplifiers.emplace(Node::kReduceL2, ReplaceReduceL2).second);
-    CHECK(simplifiers.emplace(Node::kReduceLogSum, ReplaceReduceLogSum).second);
-    CHECK(simplifiers.emplace(Node::kReduceLogSumExp, ReplaceReduceLogSumExp).second);
-    CHECK(simplifiers.emplace(Node::kSoftplus, ReplaceSoftplus).second);
-    CHECK(simplifiers.emplace(Node::kSoftsign, ReplaceSoftsign).second);
-    CHECK(simplifiers.emplace(Node::kConstantOfShape, ReplaceConstantOfShape).second);
-    CHECK(simplifiers.emplace(Node::kConstantLike, ReplaceConstantLike).second);
-    CHECK(simplifiers.emplace(Node::kShape, ReplaceShape).second);
-    CHECK(simplifiers.emplace(Node::kImageScaler, ReplaceImageScaler).second);
-    CHECK(simplifiers.emplace(Node::kSlice, ReplaceSlice).second);
-    CHECK(simplifiers.emplace(Node::kMaxRoiPool, ReplaceMaxRoiPool).second);
-    CHECK(simplifiers.emplace(Node::kIdentity, RemoveIdentity).second);
-    if (!g_use_ngraph) {
-        CHECK(simplifiers.emplace(Node::kConv, ReplaceConv).second);
-    }
+void Simplify(const BackendConfig& bc, const std::set<std::string>& simplifier_names, Graph* graph, bool gen_backprop) {
+    std::set<std::string> all_simplifier_names;
+    std::map<Node::OpType, Simplifier> simplifiers;
 
-    auto replace_if_not_supported = [&ccfg, &simplifiers](Node::OpType op, SimplifierFn fn) {
-        if (!ccfg.HasOp(op)) {
-            CHECK(simplifiers.emplace(op, fn).second) << op;
+    auto register_simplifier = [&simplifiers, &all_simplifier_names, &simplifier_names](
+                                       const Node::OpType& op, const char* name, SimplifierFn func) {
+        if (!simplifier_names.count(name)) {
+            return;
         }
+        CHECK(simplifiers.emplace(op, Simplifier(name, func)).second);
+        CHECK(all_simplifier_names.emplace(name).second);
     };
 
-    replace_if_not_supported(Node::kChainerLinear, ReplaceLinear);
-    replace_if_not_supported(Node::kChainerSelectItem, ReplaceSelectItem);
+#define REGISTER_SIMPLIFIER(op)                                       \
+    do {                                                              \
+        register_simplifier(Node::k##op, "Replace" #op, Replace##op); \
+    } while (0)
 
-    // These passes are workarounds for backends such as Chainer which
-    // do not support pooling with imbalanced padding.
-    if (g_modify_pool_with_imbalanced_pads) {
-        CHECK(simplifiers.emplace(Node::kMaxPool, ReplaceMaxPool).second);
-        CHECK(simplifiers.emplace(Node::kAveragePool, ReplaceAveragePool).second);
+    REGISTER_SIMPLIFIER(Sum);
+    REGISTER_SIMPLIFIER(Less);
+    REGISTER_SIMPLIFIER(ArgMin);
+    REGISTER_SIMPLIFIER(LpNormalization);
+    REGISTER_SIMPLIFIER(ChainerSoftmaxCrossEntropy);
+    REGISTER_SIMPLIFIER(Scan);
+    REGISTER_SIMPLIFIER(GlobalMaxPool);
+    REGISTER_SIMPLIFIER(GlobalAveragePool);
+    REGISTER_SIMPLIFIER(Flatten);
+    REGISTER_SIMPLIFIER(Mean);
+    REGISTER_SIMPLIFIER(ReduceL1);
+    REGISTER_SIMPLIFIER(ReduceL2);
+    REGISTER_SIMPLIFIER(ReduceLogSum);
+    REGISTER_SIMPLIFIER(ReduceLogSumExp);
+    REGISTER_SIMPLIFIER(ChainerReduceSumTo);
+    REGISTER_SIMPLIFIER(Softsign);
+    REGISTER_SIMPLIFIER(ConstantOfShape);
+    REGISTER_SIMPLIFIER(ConstantLike);
+    REGISTER_SIMPLIFIER(Shape);
+    REGISTER_SIMPLIFIER(ImageScaler);
+    REGISTER_SIMPLIFIER(Slice);
+    REGISTER_SIMPLIFIER(MaxRoiPool);
+    REGISTER_SIMPLIFIER(Identity);
+    REGISTER_SIMPLIFIER(ChainerLinear);
+    REGISTER_SIMPLIFIER(ChainerSelectItem);
+    REGISTER_SIMPLIFIER(MaxPool);
+    REGISTER_SIMPLIFIER(AveragePool);
+    REGISTER_SIMPLIFIER(Split);
+    REGISTER_SIMPLIFIER(QLinearMatMul);
+    REGISTER_SIMPLIFIER(SequenceEmpty);
+    REGISTER_SIMPLIFIER(Concat);
+    REGISTER_SIMPLIFIER(Constant);
+    REGISTER_SIMPLIFIER(Clip);
+    REGISTER_SIMPLIFIER(TopK);
+    REGISTER_SIMPLIFIER(Upsample);
+
+    register_simplifier(Node::kResize, "ReplaceResizeForDldt", ReplaceResizeForDldt);
+    register_simplifier(Node::kUpsample, "ReplaceUpsampleForDldt", ReplaceResizeForDldt);
+
+    // Validate `simplifier_names`.
+    for (const std::string& name : simplifier_names) {
+        if (name == "ExpandFunction") {
+            continue;
+        }
+        CHECK_EQ(1, all_simplifier_names.count(name)) << name;
     }
 
-    if (g_replace_constant) {
-        CHECK(!gen_backprop);
-        CHECK(simplifiers.emplace(Node::kConstant, ReplaceConstant).second);
-    }
-#if 0
-    CHECK(simplifiers.emplace(Node::kBatchNormalization, ReplaceBatchNormalization).second);
-#endif
+    // Register function expander
+    if (simplifier_names.count("ExpandFunction")) {
+        for (const std::string& fn : bc.GetExpandingFunctions()) {
+            Node::OpType op_enum = Node::StringToOpType(fn);
+            const onnx::OpSchema* schema = onnx::OpSchemaRegistry::Schema(fn);
+            CHECK(schema) << "unregistered onnx function: " << fn;
 
-    if (gen_backprop) {
-        CHECK(simplifiers.emplace(Node::kConcat, ReplaceConcat).second);
+            auto simplifier = Simplifier("ExpandFunction", FunctionExpander(fn, schema));
+            CHECK(simplifiers.emplace(op_enum, simplifier).second);
+        }
     }
 
     bool replaced = true;
@@ -719,19 +898,16 @@ void Simplify(const CompilerConfig& ccfg, Graph* graph, bool gen_backprop) {
         replaced = false;
         for (Node* node : graph->GetLiveNodes()) {
             auto found = simplifiers.find(node->op_type());
-            if (found == simplifiers.end()) continue;
-            if (found->second(graph, node)) {
-                // std::cerr << node->op_type() << " removed" << std::endl;
+            if (found == simplifiers.end()) {
+                continue;
+            }
+            const Simplifier& simplifier = found->second;
+            if (simplifier.fn(graph, node)) {
+                CLOG() << node->op_type() << " simplified" << std::endl;
                 graph->DetachNode(node);
                 replaced = true;
             }
         }
-    }
-
-    // Replace initializers by `Constant` for better optimization
-    // (e.g., Conv+BN fusion).
-    if (!gen_backprop && g_use_ngraph) {
-        ReplaceInitializers(graph);
     }
 }
 

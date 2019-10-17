@@ -1,26 +1,43 @@
+#include <chainerx/kernels/normalization.h>
+#include <chainerx/routines/arithmetic.h>
 #include <chainerx/routines/manipulation.h>
-#include <chainerx/routines/math.h>
 #include <chainerx/routines/normalization.h>
 #include <chainerx/routines/statistics.h>
 
 #include <common/log.h>
-#include <runtime/gen_xcvm_ops.h>
-#include <runtime/xcvm_state.h>
+#include <runtime/chainerx_util.h>
+#include <runtime/chxvm_state.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
 
 namespace {
 
-class BatchNormBackwardContext : public XCVMOpaque {
+class BatchNormBackwardContext : public ChxVMOpaque {
 public:
-    BatchNormBackwardContext(std::unique_ptr<chainerx::BatchNormForwardBackward>&& fb, chainerx::Shape x1_shape, chainerx::Shape x2_shape)
-        : fb_(std::move(fb)), x1_shape_(x1_shape), x2_shape_(x2_shape) {
+    BatchNormBackwardContext(
+            std::shared_ptr<chainerx::BatchNormGradState> state,
+            const chainerx::Array& x,
+            const chainerx::Array& gamma,
+            chainerx::Shape x1_shape,
+            chainerx::Shape x2_shape,
+            double epsilon,
+            const chainerx::Axes& sorted_axis)
+        : state_(state), x_(x), gamma_(gamma), x1_shape_(x1_shape), x2_shape_(x2_shape), epsilon_(epsilon), sorted_axis_(sorted_axis) {
     }
     virtual ~BatchNormBackwardContext() = default;
 
-    chainerx::BatchNormForwardBackward* fb() const {
-        return fb_.get();
+    const std::shared_ptr<chainerx::BatchNormGradState>& state() const {
+        return state_;
+    }
+
+    const chainerx::Array& x() const {
+        return x_;
+    }
+
+    const chainerx::Array& gamma() const {
+        return gamma_;
     }
 
     const chainerx::Shape& x1_shape() const {
@@ -31,10 +48,22 @@ public:
         return x2_shape_;
     }
 
+    double epsilon() const {
+        return epsilon_;
+    }
+
+    const chainerx::Axes& sorted_axis() const {
+        return sorted_axis_;
+    }
+
 private:
-    std::unique_ptr<chainerx::BatchNormForwardBackward> fb_;
+    std::shared_ptr<chainerx::BatchNormGradState> state_;
+    chainerx::Array x_;
+    chainerx::Array gamma_;
     chainerx::Shape x1_shape_;
     chainerx::Shape x2_shape_;
+    double epsilon_;
+    chainerx::Axes sorted_axis_;
 };
 
 // TODO(hamaji): Copied from ChainerX's code.
@@ -106,10 +135,22 @@ PreprocessBatchNormResult PreprocessBatchNorm(
     return {std::move(gamma_reshaped), std::move(beta_reshaped), std::move(mean_reshaped), std::move(var_reshaped), sorted_axis};
 }
 
+// A workaround for <4D tensors with cuDNN.
+chainerx::Shape UnsqueezedForBN(const chainerx::Array& x) {
+    if (!IsCudaDevice(&x.device())) {
+        return x.shape();
+    }
+    chainerx::Shape shape = x.shape();
+    while (shape.size() < 4) {
+        shape.push_back(1);
+    }
+    return shape;
+}
+
 }  // namespace
 
-std::tuple<chainerx::Array, XCVMOpaque*, chainerx::Array, chainerx::Array, chainerx::Array, chainerx::Array> BatchNormalizationOp::RunImpl(
-        XCVMState* st,
+std::tuple<chainerx::Array, ChxVMOpaque*, chainerx::Array, chainerx::Array, chainerx::Array, chainerx::Array> BatchNormalizationOp::RunImpl(
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& s,
         const chainerx::Array& bias,
@@ -129,13 +170,25 @@ std::tuple<chainerx::Array, XCVMOpaque*, chainerx::Array, chainerx::Array, chain
     } else {
         result = PreprocessBatchNorm(x, s, bias, mean, var, axes);
     }
-    std::unique_ptr<chainerx::BatchNormForwardBackward> fb =
-            x.device().GetBatchNormForwardBackward(result.mean, result.var, epsilon, decay, result.sorted_axis);
     const Array& gamma_reshaped = result.gamma;
     const Array& beta_reshaped = result.beta;
-    chainerx::Array out = fb->Forward(x, gamma_reshaped, beta_reshaped);
-    XCVMOpaque* ctx = new BatchNormBackwardContext(std::move(fb), s.shape(), bias.shape());
-    if (st->options().dump_memory_usage) {
+    std::shared_ptr<chainerx::BatchNormGradState> state;
+    chainerx::Array out;
+    chainerx::Shape shape = UnsqueezedForBN(x);
+    std::tie(out, state) = x.device().backend().CallKernel<chainerx::BatchNormKernel>(
+            x.Reshape(shape),
+            gamma_reshaped,
+            beta_reshaped,
+            result.mean,
+            result.var,
+            epsilon,
+            decay,
+            result.sorted_axis,
+            true,
+            absl::nullopt);
+    out = out.Reshape(x.shape());
+    ChxVMOpaque* ctx = new BatchNormBackwardContext(state, x, gamma_reshaped, s.shape(), bias.shape(), epsilon, result.sorted_axis);
+    if (st->options().dump_memory_usage >= 1) {
         ctx->SetRetainedArrays({x, gamma_reshaped, beta_reshaped, result.mean, result.var});
     }
     chainerx::Array saved_mean, saved_var;
@@ -155,7 +208,7 @@ std::tuple<chainerx::Array, XCVMOpaque*, chainerx::Array, chainerx::Array, chain
 }
 
 chainerx::Array FixedBatchNormalizationOp::RunImpl(
-        XCVMState* st,
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& s,
         const chainerx::Array& bias,
@@ -167,19 +220,41 @@ chainerx::Array FixedBatchNormalizationOp::RunImpl(
     for (int i = 0; i < x.shape().size(); ++i) {
         if (i != 1) axes.push_back(i);
     }
-    return chainerx::FixedBatchNorm(x, s, bias, mean, var, epsilon, axes);
+    chainerx::Shape shape = UnsqueezedForBN(x);
+    return chainerx::FixedBatchNorm(x.Reshape(shape), s, bias, mean, var, epsilon, axes).Reshape(x.shape());
 }
 
 std::tuple<chainerx::Array, chainerx::Array, chainerx::Array> BatchNormalizationGradOp::RunImpl(
-        XCVMState* st, const chainerx::Array& gy, const XCVMOpaque& ctx) {
+        ChxVMState* st, const chainerx::Array& gy, const ChxVMOpaque& ctx) {
     auto& context = dynamic_cast<const BatchNormBackwardContext&>(ctx);
-    std::array<chainerx::Array, 3> gxs = context.fb()->Backward(gy);
-    chainerx::Array gx1 = chainerx::Reshape(gxs[1], context.x1_shape());
-    chainerx::Array gx2 = chainerx::Reshape(gxs[2], context.x2_shape());
-    return std::forward_as_tuple(gxs[0], gx1, gx2);
+    chainerx::Shape shape = UnsqueezedForBN(context.x());
+    chainerx::Array gx, ggamma, gbeta;
+    std::tie(gx, ggamma, gbeta) = gy.device().backend().CallKernel<chainerx::BatchNormGradKernel>(
+            context.x().Reshape(shape),
+            context.gamma(),
+            gy.Reshape(shape),
+            context.epsilon(),
+            context.sorted_axis(),
+            context.state(),
+            absl::nullopt,
+            absl::nullopt,
+            absl::nullopt);
+    gx = gx.Reshape(context.x().shape());
+    chainerx::Array gx1 = chainerx::Reshape(ggamma, context.x1_shape());
+    chainerx::Array gx2 = chainerx::Reshape(gbeta, context.x2_shape());
+    return std::forward_as_tuple(gx, gx1, gx2);
 }
 
-std::tuple<chainerx::Array, chainerx::Array> LRNOp::RunImpl(XCVMState* st, const chainerx::Array& x) {
+chainerx::Array BatchNormalizationExpandedStatsShapeOp::RunImpl(ChxVMState* st, const chainerx::Array& x) {
+    const int axis = 1;
+    std::vector<int64_t> shape;
+    for (size_t i = 0; i < x.shape().size(); ++i) {
+        shape.push_back(i == axis ? x.shape()[i] : 1);
+    }
+    return MakeHostArray(chainerx::Dtype::kInt64, {static_cast<int64_t>(shape.size())}, shape.data());
+}
+
+std::tuple<chainerx::Array, chainerx::Array> LRNOp::RunImpl(ChxVMState* st, const chainerx::Array& x) {
     int half_n = size / 2;
     chainerx::Array x2 = x * x;
     chainerx::Array sum_part = x2.Copy();
@@ -192,14 +267,13 @@ std::tuple<chainerx::Array, chainerx::Array> LRNOp::RunImpl(XCVMState* st, const
         sum_part.At(indices2) += x2.At(indices1);
     }
     chainerx::Array unit_scale = bias + (alpha / size) * sum_part;
-    // TODO(hamaji): Add `Pow` and use it.
-    chainerx::Array scale = chainerx::Exp(chainerx::Log(unit_scale) * -beta);
+    chainerx::Array scale = chainerx::Power(unit_scale, -beta);
     chainerx::Array out = x * scale;
     return std::tie(out, unit_scale);
 }
 
 chainerx::Array LRNGradOp::RunImpl(
-        XCVMState* st, const chainerx::Array& x, const chainerx::Array& y, const chainerx::Array& gy, const chainerx::Array& unit_scale) {
+        ChxVMState* st, const chainerx::Array& x, const chainerx::Array& y, const chainerx::Array& gy, const chainerx::Array& unit_scale) {
     int half_n = size / 2;
     chainerx::Array summand = y * gy / unit_scale;
     chainerx::Array sum_part = summand.Copy();
@@ -211,9 +285,8 @@ chainerx::Array LRNGradOp::RunImpl(
         sum_part.At(indices1) += summand.At(indices2);
         sum_part.At(indices2) += summand.At(indices1);
     }
-    // TODO(hamaji): Add `Pow` and use it.
     // TODO(hamaji): Decide whether we want to keep this value or recompute.
-    chainerx::Array scale = chainerx::Exp(chainerx::Log(unit_scale) * -beta);
+    chainerx::Array scale = chainerx::Power(unit_scale, -beta);
     return gy * scale - 2 * (alpha / size) * beta * x * sum_part;
 }
 

@@ -63,13 +63,25 @@ public:
     Value* AddOutputValue(const std::string& name, const Type& type, int index = -1);
     Value* AddNullValue();
 
+    void ResetKind(Value* value);
+
     Node* AddNode(
-            Node::OpType op_type, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs, const std::string& base = "");
+            Node::OpType op_type,
+            const std::vector<Value*>& inputs,
+            const std::vector<Value*>& outputs,
+            const std::string& base = "",
+            const std::string& domain = onnx::ONNX_DOMAIN);
+    Node* AddNode(
+            const onnx::NodeProto& base,
+            const std::vector<Value*>& inputs,
+            const std::vector<Value*>& outputs,
+            const std::string& base_name = "");
 
     void DetachNode(Node* node);
 
     std::vector<Node*> GetTopologicallySortedNodes() const;
     void SortNodesTopologically();
+    std::vector<std::pair<Value*, int>> GetTopologicallySortedValuesWithDistance() const;
 
     // Returns a map from nodes to the number of their users.
     std::map<Node*, int> GetNecessaryNodesAndInputCounts(const std::vector<Value*>& output_values) const;
@@ -89,7 +101,7 @@ public:
 
     void InferShapes();
 
-    void ResetGradients();
+    void ResetGradients(bool reset_grad_names);
 
     void DeleteDetached();
 

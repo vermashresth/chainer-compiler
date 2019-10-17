@@ -29,8 +29,35 @@ Dtype::DataType FromONNX(int xtype) {
             return Dtype::DataType::kFloat64;
         case onnx::TensorProto::UNDEFINED:
             return Dtype::DataType::kUnknown;
+        case onnx::TensorProto::STRING:
+            return Dtype::DataType::kString;
         default:
             CHECK(false) << "Unsupported ONNX data type: " << xtype;
+    }
+}
+
+Dtype::DataType FromChainerX(chainerx::Dtype type) {
+    switch (type) {
+        case chainerx::Dtype::kBool:
+            return Dtype::DataType::kBool;
+        case chainerx::Dtype::kInt8:
+            return Dtype::DataType::kInt8;
+        case chainerx::Dtype::kInt16:
+            return Dtype::DataType::kInt16;
+        case chainerx::Dtype::kInt32:
+            return Dtype::DataType::kInt32;
+        case chainerx::Dtype::kInt64:
+            return Dtype::DataType::kInt64;
+        case chainerx::Dtype::kUInt8:
+            return Dtype::DataType::kUInt8;
+        case chainerx::Dtype::kFloat16:
+            return Dtype::DataType::kFloat16;
+        case chainerx::Dtype::kFloat32:
+            return Dtype::DataType::kFloat32;
+        case chainerx::Dtype::kFloat64:
+            return Dtype::DataType::kFloat64;
+        default:
+            CHECK(false) << "Unknown ChainerX data type: " << type;
     }
 }
 
@@ -40,6 +67,34 @@ Dtype::Dtype(int xtype) : type_(FromONNX(xtype)) {
 }
 
 Dtype::Dtype(DataType type) : type_(type) {
+}
+
+Dtype::Dtype(chainerx::Dtype type) : type_(FromChainerX(type)) {
+}
+
+chainerx::Dtype Dtype::chx() const {
+    switch (type_) {
+        case kBool:
+            return chainerx::Dtype::kBool;
+        case kInt8:
+            return chainerx::Dtype::kInt8;
+        case kInt16:
+            return chainerx::Dtype::kInt16;
+        case kInt32:
+            return chainerx::Dtype::kInt32;
+        case kInt64:
+            return chainerx::Dtype::kInt64;
+        case kUInt8:
+            return chainerx::Dtype::kUInt8;
+        case kFloat16:
+            return chainerx::Dtype::kFloat16;
+        case kFloat32:
+            return chainerx::Dtype::kFloat32;
+        case kFloat64:
+            return chainerx::Dtype::kFloat64;
+        default:
+            CHECK(false) << "Unknown ChainerX data type: " << type_;
+    }
 }
 
 std::string Dtype::ToString() const {
@@ -56,10 +111,14 @@ std::string Dtype::ToString() const {
             return "INT64";
         case kUInt8:
             return "UINT8";
+        case kFloat16:
+            return "FLOAT16";
         case kFloat32:
             return "FLOAT32";
         case kFloat64:
             return "FLOAT64";
+        case kString:
+            return "STRING";
         case kUnknown:
             return "UNKNOWN";
         default:
@@ -87,6 +146,8 @@ onnx::TensorProto::DataType Dtype::ToONNX() const {
             return onnx::TensorProto::FLOAT;
         case kFloat64:
             return onnx::TensorProto::DOUBLE;
+        case kString:
+            return onnx::TensorProto::STRING;
         case kUnknown:
             return onnx::TensorProto::UNDEFINED;
         default:
@@ -114,6 +175,9 @@ int Dtype::SizeOf() const {
             return 4;
         case kFloat64:
             return 8;
+        case kString:
+            // TODO(take-cheeze): Make size accurate
+            return 0;
         default:
             CHECK(false) << "Unknown data type: " << ToString();
     }

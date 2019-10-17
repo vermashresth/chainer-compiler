@@ -6,14 +6,14 @@ This document assumes you have successfully built the code by following [set up 
 
 In this section, we run an existing ONNX model by the runtime of Chainer compiler.
 
-To run ResNet50 model downloaded by [setup.sh](/setup.sh), run
+To run ShuffleNet model in the repository, run
 
 ```shell-session
-$ ./setup.sh
-$ ./build/tools/run_onnx --device cuda --test data/resnet50 --trace
+$ make -C build
+$ ./build/tools/run_onnx --device cuda --test data/shufflenet --trace
 ```
 
-The command above uses inputs and outputs in `data/resnet50/test_data_set_?` to feed and verify the model.
+The command above uses inputs and outputs in `data/shufflenet/test_data_set_?` to feed and verify the model.
 
 VGG19 works, too:
 
@@ -97,3 +97,7 @@ See examples directory for more details. You can run the MNIST example by
 ```shell-session
 $ python3 examples/mnist/train_mnist.py --compile --dump_onnx -d cuda
 ```
+
+## Use with SNPE
+- Set `$SNPE_ROOT` to the directory of extracted `snpe-1.x.x.zip`
+- Pass `-DCHAINER_COMPILER_SNPE_INCLUDE_DIR=$SNPE_ROOT/include -DCHAINER_COMPILER_SNPE_LIBRARY_DIR=$SNPE_ROOT/lib/x86_64-linux-clang` to cmake. Replace `x86_64-linux-clang` with target architecture for ChxVM runtime when needed

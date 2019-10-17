@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 import os
 import sys
@@ -7,10 +7,10 @@ import chainer
 import numpy as np
 import onnx
 
+from test_case import TestCase
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(project_root, 'ch2o'))
-import ch2o  # noqa
+
+from chainer_compiler import ch2o
 
 F = chainer.functions
 L = chainer.links
@@ -21,7 +21,7 @@ def create_backprop_test(test_name, model, input_values):
     model.cleargrads()
     output_values = model(*map(chainer.variable.Variable, input_values))
 
-    test_dir = 'out/backprop_test_pc_%s' % test_name
+    test_dir = 'out/%s' % test_name
     test_data_set_dir = os.path.join(test_dir, 'test_data_set_0')
     os.makedirs(test_data_set_dir, exist_ok=True)
 
@@ -65,9 +65,10 @@ def create_backprop_test(test_name, model, input_values):
         fp.write(xmodel.SerializeToString())
 
 
-class BackpropTest(object):
-    def __init__(self, name, model, inputs, dtype, rtol=None, fail=False):
-        self.name = '%s_%s' % (name, dtype.__name__)
+class BackpropTest(TestCase):
+    def __init__(self, name, model, inputs, dtype, **kwargs):
+        name = 'backprop_test_pc_%s_%s' % (name, dtype.__name__)
+        super().__init__(basedir='out', name=name, **kwargs)
         self.model = model
 
         def cast(inp):
@@ -76,8 +77,6 @@ class BackpropTest(object):
             return inp
 
         self.inputs = [cast(inp) for inp in inputs]
-        self.rtol = rtol
-        self.fail = fail
 
     def generate(self):
         create_backprop_test(self.name, self.model, self.inputs)
@@ -93,9 +92,8 @@ def _get_backprop_tests(dtype):
     F = chainer.functions
     tests = []
 
-    def test(name, model, *inputs, rtol=None, fail=False):
-        tests.append(BackpropTest(name, model, inputs, dtype,
-                                  rtol=rtol, fail=fail))
+    def test(name, model, *inputs, **kwargs):
+        tests.append(BackpropTest(name, model, inputs, dtype, **kwargs))
 
     def aranges(*shape):
         r = np.prod(shape)
@@ -308,7 +306,9 @@ def _get_backprop_tests(dtype):
         def forward(self, x):
             return self.emb(x)
 
-    test('embed', Embed(), np.array([3, 4, 5, 5, 5, 2]))
+    # TODO(hamaji): Do not skip shape inference.
+    test('embed', Embed(), np.array([3, 4, 5, 5, 5, 2]),
+         skip_shape_inference=True)
 
     class Pad(chainer.Chain):
         def __init__(self):

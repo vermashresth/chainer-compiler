@@ -5,41 +5,31 @@
 #include <cstring>
 #include <sstream>
 
+#include <chainerx/routines/creation.h>
+
 #include <common/log.h>
 #include <compiler/serializer_util.h>
+#include <runtime/chainerx_util.h>
 
 namespace chainer_compiler {
 
 namespace {
 
+typedef std::unique_ptr<void, decltype(&std::free)> UniqueData;
+
 template <typename From, typename To>
-Tensor::UniqueData LoadDataFromRepeated(const ::google::protobuf::RepeatedField<From>& a) {
+UniqueData LoadDataFromRepeated(const ::google::protobuf::RepeatedField<From>& a) {
     static_assert(sizeof(From) >= sizeof(To), "invalid load");
-    Tensor::UniqueData p(std::malloc(sizeof(To) * a.size()), &std::free);
+    UniqueData p(std::malloc(sizeof(To) * a.size()), &std::free);
     for (int i = 0; i < a.size(); ++i) {
         static_cast<To*>(p.get())[i] = a.Get(i);
     }
     return p;
 }
 
-template <typename To>
-Tensor::UniqueData LoadDataFromRawData(const void* data, int64_t num_elements) {
-    Tensor::UniqueData p(std::malloc(num_elements * sizeof(To)), &std::free);
-    for (int i = 0; i < num_elements; ++i) {
-        static_cast<To*>(p.get())[i] = reinterpret_cast<const To*>(data)[i];
-    }
-    return p;
-}
-
-template <typename To>
-Tensor::UniqueData LoadDataFromRawData(const std::string& data, int64_t num_elements) {
-    CHECK_EQ(num_elements * sizeof(To), data.size());
-    return LoadDataFromRawData<To>(data.data(), num_elements);
-}
-
 template <typename From, typename To>
-Tensor::UniqueData LoadDataFromTypedData(const void* data, int64_t num_elements) {
-    Tensor::UniqueData p(std::malloc(num_elements * sizeof(To)), &std::free);
+UniqueData LoadDataFromTypedData(const void* data, int64_t num_elements) {
+    UniqueData p(std::malloc(num_elements * sizeof(To)), &std::free);
     for (int i = 0; i < num_elements; ++i) {
         static_cast<To*>(p.get())[i] = reinterpret_cast<const From*>(data)[i];
     }
@@ -47,7 +37,7 @@ Tensor::UniqueData LoadDataFromTypedData(const void* data, int64_t num_elements)
 }
 
 template <typename From>
-Tensor::UniqueData LoadDataFromTypedData(Dtype dtype, const void* data, int64_t num_elements) {
+UniqueData LoadDataFromTypedData(Dtype dtype, const void* data, int64_t num_elements) {
     switch (dtype) {
         case Dtype::kBool:
             return LoadDataFromTypedData<From, bool>(data, num_elements);
@@ -61,6 +51,14 @@ Tensor::UniqueData LoadDataFromTypedData(Dtype dtype, const void* data, int64_t 
             return LoadDataFromTypedData<From, int64_t>(data, num_elements);
         case Dtype::kUInt8:
             return LoadDataFromTypedData<From, uint8_t>(data, num_elements);
+        case Dtype::kFloat16: {
+            UniqueData p(std::malloc(num_elements * sizeof(chainerx::Float16)), &std::free);
+            auto out_base_ptr = static_cast<chainerx::Float16*>(p.get());
+            for (int i = 0; i < num_elements; ++i) {
+                out_base_ptr[i] = chainerx::Float16(reinterpret_cast<const From*>(data)[i]);
+            }
+            return p;
+        }
         case Dtype::kFloat32:
             return LoadDataFromTypedData<From, float>(data, num_elements);
         case Dtype::kFloat64:
@@ -83,15 +81,16 @@ void DumpDataToRepeated(const Tensor& t, ::google::protobuf::RepeatedField<To>* 
     DumpDataToRepeated<To, To>(t, a);
 }
 
-}  // namespace
-
-Tensor::Tensor(const onnx::TensorProto& xtensor)
-    : dims_(xtensor.dims().begin(), xtensor.dims().end()),
-      dtype_(xtensor.data_type()),
-      data_(nullptr, &std::free),
-      name_(xtensor.name()),
-      doc_string_(xtensor.doc_string()) {
+absl::variant<chainerx::Array, std::vector<std::string>> TensorProtoToArray(onnx::TensorProto const& xtensor) {
     CHECK(!xtensor.has_segment()) << "Segmented TensorProto not supported";
+
+    Dtype dtype(xtensor.data_type());
+    chainerx::Shape shape(xtensor.dims().begin(), xtensor.dims().end());
+
+    if (xtensor.data_type() == onnx::TensorProto::STRING) {
+        CHECK_LT(shape.size(), 2) << ">1D string tensor is not supported";
+        return std::vector<std::string>(xtensor.string_data().begin(), xtensor.string_data().end());
+    }
 
     if (xtensor.has_raw_data()) {
         CHECK_EQ(0, xtensor.float_data_size());
@@ -101,83 +100,81 @@ Tensor::Tensor(const onnx::TensorProto& xtensor)
         CHECK_EQ(0, xtensor.double_data_size());
         CHECK_EQ(0, xtensor.uint64_data_size());
 
-        switch (dtype_) {
-            case Dtype::kBool:
-                data_.reset(LoadDataFromRawData<bool>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kInt8:
-                data_.reset(LoadDataFromRawData<int8_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kInt16:
-                data_.reset(LoadDataFromRawData<int16_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kInt32:
-                data_.reset(LoadDataFromRawData<int32_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kInt64:
-                data_.reset(LoadDataFromRawData<int64_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kUInt8:
-                data_.reset(LoadDataFromRawData<uint8_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kFloat16:
-                data_.reset(LoadDataFromRawData<int16_t>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kFloat32:
-                data_.reset(LoadDataFromRawData<float>(xtensor.raw_data(), NumElements()).release());
-                break;
-            case Dtype::kFloat64:
-                data_.reset(LoadDataFromRawData<double>(xtensor.raw_data(), NumElements()).release());
-                break;
-            default:
-                CHECK(false) << "Unknown data type: " << dtype_.ToString();
-        }
+        return runtime::MakeHostArray(dtype.chx(), std::move(shape), xtensor.raw_data().data());
     } else {
-        switch (dtype_) {
+        UniqueData data(NULL, &std::free);
+        switch (dtype) {
             case Dtype::kBool:
-                data_.reset(LoadDataFromRepeated<int32_t, bool>(xtensor.int32_data()).release());
+                data = LoadDataFromRepeated<int32_t, bool>(xtensor.int32_data());
                 break;
             case Dtype::kInt8:
-                data_.reset(LoadDataFromRepeated<int32_t, int8_t>(xtensor.int32_data()).release());
+                data = LoadDataFromRepeated<int32_t, int8_t>(xtensor.int32_data());
                 break;
             case Dtype::kInt16:
-                data_.reset(LoadDataFromRepeated<int32_t, int16_t>(xtensor.int32_data()).release());
+                data = LoadDataFromRepeated<int32_t, int16_t>(xtensor.int32_data());
                 break;
             case Dtype::kInt32:
-                data_.reset(LoadDataFromRepeated<int32_t, int32_t>(xtensor.int32_data()).release());
+                data = LoadDataFromRepeated<int32_t, int32_t>(xtensor.int32_data());
                 break;
             case Dtype::kInt64:
-                data_.reset(LoadDataFromRepeated<int64_t, int64_t>(xtensor.int64_data()).release());
+                data = LoadDataFromRepeated<int64_t, int64_t>(xtensor.int64_data());
                 break;
             case Dtype::kUInt8:
-                data_.reset(LoadDataFromRepeated<int32_t, uint8_t>(xtensor.int32_data()).release());
+                data = LoadDataFromRepeated<int32_t, uint8_t>(xtensor.int32_data());
                 break;
+            case Dtype::kFloat16: {
+                auto a = xtensor.int32_data();
+                UniqueData p(std::malloc(sizeof(chainerx::Float16) * a.size()), &std::free);
+                for (int i = 0; i < a.size(); ++i) {
+                    static_cast<chainerx::Float16*>(p.get())[i] = chainerx::Float16::FromData(a.Get(i));
+                }
+                data = std::move(p);
+            } break;
             case Dtype::kFloat32:
-                data_.reset(LoadDataFromRepeated<float, float>(xtensor.float_data()).release());
+                data = LoadDataFromRepeated<float, float>(xtensor.float_data());
                 break;
             case Dtype::kFloat64:
-                data_.reset(LoadDataFromRepeated<double, double>(xtensor.double_data()).release());
+                data = LoadDataFromRepeated<double, double>(xtensor.double_data());
                 break;
             default:
-                CHECK(false) << "Unknown data type: " << dtype_.ToString();
+                CHECK(false) << "Unknown data type: " << dtype.ToString();
         }
+        return runtime::MakeHostArray(dtype.chx(), std::move(shape), data.get());
     }
 }
 
-Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, void* data)
-    : dims_(dims), dtype_(dtype), data_(data, &std::free), name_(name), doc_string_() {
+}  // namespace
+
+Tensor::Tensor(const onnx::TensorProto& xtensor)
+    : data_(TensorProtoToArray(xtensor)), name_(xtensor.name()), doc_string_(xtensor.doc_string()) {
+}
+
+Tensor::Tensor(std::string const& name, chainerx::Array ary) : data_(chainerx::AsContiguous(ary)), name_(name) {
 }
 
 Tensor::~Tensor() {
+    if (data_.index() == 0) {
+        CHECK(chx().IsContiguous());
+    }
 }
 
 void Tensor::ToONNX(onnx::TensorProto* xtensor) const {
-    for (int64_t d : dims_) xtensor->add_dims(d);
-    xtensor->set_data_type(dtype_.ToONNX());
+    if (data_.index() == 1) {
+        xtensor->set_data_type(onnx::TensorProto::STRING);
+        DUMP_STRING(xtensor, name);
+        DUMP_STRING(xtensor, doc_string);
+        for (const std::string& s : absl::get<1>(data_)) {
+            xtensor->add_string_data(s);
+        }
+        return;
+    }
+
+    for (int64_t d : dims()) xtensor->add_dims(d);
+    xtensor->set_data_type(dtype().ToONNX());
     DUMP_STRING(xtensor, name);
     DUMP_STRING(xtensor, doc_string);
 
-    switch (dtype_) {
+    switch (dtype()) {
         case Dtype::kBool:
             DumpDataToRepeated<bool, int>(*this, xtensor->mutable_int32_data());
             break;
@@ -196,6 +193,13 @@ void Tensor::ToONNX(onnx::TensorProto* xtensor) const {
         case Dtype::kUInt8:
             DumpDataToRepeated<uint8_t, int>(*this, xtensor->mutable_int32_data());
             break;
+        case Dtype::kFloat16: {
+            auto a = xtensor->mutable_int32_data();
+            CHECK_LE(static_cast<size_t>(ElementSize()), sizeof(int));
+            for (int64_t i = 0; i < NumElements(); ++i) {
+                a->Add(Get<chainerx::Float16>(i).data());
+            }
+        } break;
         case Dtype::kFloat32:
             DumpDataToRepeated(*this, xtensor->mutable_float_data());
             break;
@@ -203,7 +207,7 @@ void Tensor::ToONNX(onnx::TensorProto* xtensor) const {
             DumpDataToRepeated(*this, xtensor->mutable_double_data());
             break;
         default:
-            CHECK(false) << "Unknown data type: " << dtype_.ToString();
+            CHECK(false) << "Unknown data type: " << dtype().ToString();
     }
 }
 
@@ -213,36 +217,45 @@ std::string Tensor::DebugString() const {
     return xtensor.DebugString();
 }
 
+const std::vector<int64_t> Tensor::dims() const {
+    chainerx::Shape const& s = chx().shape();
+    return std::vector<int64_t>(s.begin(), s.end());
+}
+
+Dtype Tensor::dtype() const {
+    if (data_.index() == 1) {
+        return Dtype(onnx::TensorProto::STRING);
+    }
+    return Dtype(chx().dtype());
+}
+
 int Tensor::ElementSize() const {
-    return dtype_.SizeOf();
+    return dtype().SizeOf();
 }
 
 int64_t Tensor::NumElements() const {
-    int64_t num = 1;
-    for (int64_t d : dims_) {
-        if (d < 0) return -1;
-        num *= d;
-    }
-    return num;
+    return chx().shape().GetTotalSize();
 }
 
-template <typename T>
-Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, const std::vector<T>& data)
-    : dims_(dims), dtype_(dtype), data_(LoadDataFromTypedData<T>(dtype, data.data(), data.size())), name_(name) {
+Tensor::Tensor(const std::string& name, const Tensor& t) : data_(t.data_), name_(name), doc_string_(t.doc_string_) {
 }
 
-template Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, const std::vector<double>& data);
-template Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, const std::vector<float>& data);
-template Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, const std::vector<int>& data);
-template Tensor::Tensor(const std::string& name, Dtype dtype, const std::vector<int64_t>& dims, const std::vector<long>& data);
+bool Tensor::IsArray() const {
+    return absl::holds_alternative<chainerx::Array>(data_);
+}
 
-Tensor::Tensor(const std::string& name, const Tensor& t)
-    : dims_(t.dims_),
-      dtype_(t.dtype_),
-      data_(Tensor::UniqueData(std::malloc(t.ElementSize() * t.NumElements()), &std::free)),
-      name_(name),
-      doc_string_(t.doc_string_) {
-    std::memcpy(data_.get(), t.data_.get(), t.ElementSize() * t.NumElements());
+const void* Tensor::GetRawData() const {
+    return runtime::RawStartPtr(chx());
+}
+
+const chainerx::Array& Tensor::chx() const {
+    CHECK(IsArray());
+    return absl::get<0>(data_);
+}
+
+const std::vector<std::string>& Tensor::str() const {
+    CHECK(!IsArray());
+    return absl::get<1>(data_);
 }
 
 }  // namespace chainer_compiler

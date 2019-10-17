@@ -4,6 +4,7 @@
 
 #include <vector>
 
+#include <chainerx/routines/creation.h>
 #include <common/iterator.h>
 #include <compiler/evaluator.h>
 #include <compiler/graph.h>
@@ -20,6 +21,9 @@ namespace {
 bool HasKnownInputsAndUnknownOutputs(const Node& node) {
     bool has_unknown_outputs = false;
     for (Value* output : node.outputs()) {
+        if (output->IsNull()) {
+            continue;
+        }
         const Type& type = output->type();
         if (type.kind() == Type::Kind::kTensor && !type.HasKnownShape()) {
             has_unknown_outputs = true;
@@ -45,6 +49,9 @@ bool MaybeEvaluateShape(Node* node) {
     switch (node->op_type()) {
         // TODO(hamaji): Handle more ops.
         case Node::kOneHot: {
+            if (!node->input(1)->producer()) {
+                return false;
+            }
             if (node->input(1)->producer()->op_type() == Node::kConstant) {
                 DoEvaluateShape(node);
             }
@@ -52,7 +59,7 @@ bool MaybeEvaluateShape(Node* node) {
         }
 
         default:
-            CLOG() << "Not propagate " << node->ToString() << std::endl;
+            CLOG() << "Not evaluate shape: " << node->ToString() << std::endl;
     }
     return false;
 }
@@ -76,12 +83,9 @@ void DoEvaluateShape(Node* node) {
             CHECK(t) << const_node->DebugString();
         } else {
             const Type& type = input->type();
-            int64_t nbytes = type.GetNBytes();
-            CHECK_LT(0, nbytes);
-            Tensor::UniqueData data(std::malloc(nbytes), &std::free);
-            memset(data.get(), 0, nbytes);
             CHECK_NE(Dtype::kUnknown, type.dtype()) << input->DebugString();
-            t = new Tensor(input->name(), type.dtype(), type.dims(), data.release());
+            chainerx::Shape shape(type.dims().begin(), type.dims().end());
+            t = new Tensor(input->name(), chainerx::Zeros(shape, type.dtype().chx()));
             tensor_buf.emplace_back(t);
         }
         feeds.emplace_back(input, t);

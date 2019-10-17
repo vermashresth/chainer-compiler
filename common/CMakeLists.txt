@@ -9,22 +9,23 @@ add_library(chainer_compiler_common
 set_hidden_(chainer_compiler_common)
 
 include_directories(${GOOGLETEST_INCLUDE_DIRS})
-add_executable(common_test
+add_executable(chainer_compiler_common_test
   iterator_test.cc
   strutil_test.cc
   )
-target_link_libraries(common_test
+target_link_libraries(chainer_compiler_common_test
   chainer_compiler_common
   onnx_proto
-  protobuf
+  ${PROTOBUF_LIBRARY}
   gtest
   gtest_main
-  pthread
+  ${CHAINER_COMPILER_PTHREAD_LIBRARIES}
   )
-add_dependencies(common_test onnx_files)
+
+add_dependencies(chainer_compiler_common_test gen_onnx_proto)
 
 add_test(
-  NAME common_test
-  COMMAND common_test
+  NAME chainer_compiler_common_test
+  COMMAND chainer_compiler_common_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
   )

@@ -12,7 +12,8 @@
 
 #include <common/log.h>
 #include <common/strutil.h>
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/chainerx_util.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
@@ -87,7 +88,7 @@ CUfunction CompileAndLoad(const std::string& name, const std::string& code) {
 #endif
 
 std::vector<chainerx::Array> ElementWiseNvrtcOp::RunImpl(
-        chainer_compiler::runtime::XCVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
+        chainer_compiler::runtime::ChxVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
 #if CHAINER_COMPILER_ENABLE_NVRTC
     CHECK(!inputs.empty());
     const std::string& name = StrCat("fusion", fusion_id);
@@ -107,9 +108,7 @@ std::vector<chainerx::Array> ElementWiseNvrtcOp::RunImpl(
             // TODO(hamaji): Generate code which works without broadcast.
             input = input.BroadcastTo(shape);
         }
-        if (!input.IsContiguous()) {
-            input = chainerx::Copy(input);
-        }
+        input = chainerx::AsContiguous(input);
         inputs.push_back(input);
     }
 
@@ -133,10 +132,10 @@ std::vector<chainerx::Array> ElementWiseNvrtcOp::RunImpl(
     const size_t block_x = std::min(block_max_size, size);
     std::vector<void*> ptrs;
     for (chainerx::Array& input : inputs) {
-        ptrs.push_back(input.raw_data());
+        ptrs.push_back(RawStartPtr(input));
     }
     for (chainerx::Array& output : outputs) {
-        ptrs.push_back(output.raw_data());
+        ptrs.push_back(RawStartPtr(output));
     }
     std::vector<void*> args = {&size};
     for (void*& p : ptrs) args.push_back(&p);

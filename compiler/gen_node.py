@@ -43,13 +43,17 @@ NODES = []
 
 class NodeDef(object):
 
-    def __init__(self, op_type, num_inputs, num_outputs, **kwargs):
+    def __init__(self, op_type, num_inputs, num_outputs, domain='', **kwargs):
         self.op_type = op_type
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
         self.attributes = kwargs
         self.attributes.update(CHAINER_COMPILERX_GLOBAL_ATTRS)
         self.attr_defs = {}  # To be filled after parsed.
+        self.domain = domain
+        # TODO(take-cheeze): Remove this when domain is specified correctly
+        if op_type.startswith('Chainer') and len(domain) == 0:
+            self.domain = 'org.chainer'
         NODES.append(self)
 
 
@@ -59,6 +63,9 @@ NodeDef('Reciprocal', 1, 1)
 NodeDef('Exp', 1, 1)
 NodeDef('Log', 1, 1)
 NodeDef('Sqrt', 1, 1)
+NodeDef('IsNaN', 1, 1)
+NodeDef('IsInf', 1, 1, detect_negative=1, detect_positive=1)
+NodeDef('Sign', 1, 1)
 
 NodeDef('Sin', 1, 1)
 NodeDef('Sinh', 1, 1)
@@ -72,6 +79,7 @@ NodeDef('Acos', 1, 1)
 NodeDef('Acosh', 1, 1)
 NodeDef('Atan', 1, 1)
 NodeDef('Atanh', 1, 1)
+NodeDef('Erf', 1, 1)
 
 NodeDef('Abs', 1, 1)
 NodeDef('Relu', 1, 1)
@@ -90,6 +98,7 @@ NodeDef('Add', 2, 1)
 NodeDef('Sub', 2, 1)
 NodeDef('Mul', 2, 1)
 NodeDef('Div', 2, 1)
+NodeDef('Mod', 2, 1, fmod=0)
 NodeDef('Pow', 2, 1)
 NodeDef('Equal', 2, 1)
 NodeDef('Greater', 2, 1)
@@ -121,18 +130,24 @@ NodeDef('Slice', (1, 3, 4, 5), 1,
 # TOOD(hamaji): Remove this as it is deprecated in ONNX.
 NodeDef('DynamicSlice', (3, 4, 5), 1)
 NodeDef('Gather', 2, 1, axis=0)
+NodeDef('GatherElements', 2, 1, axis=0)
+NodeDef('GatherND', 2, 1)
+NodeDef('Scatter', 3, 1, axis=0)
+NodeDef('ScatterElements', 3, 1, axis=0)
+NodeDef('ScatterND', 3, 1)
 NodeDef('Concat', None, 1, axis=Required(int))
 NodeDef('Split', 1, None, axis=0, split=[int])
 NodeDef('Transpose', 1, 1, perm=[int])
 NodeDef('EyeLike', 1, 1, dtype=Dtype, k=0)
-NodeDef('DepthToSpace', 1, 1, blocksize=Required(int))
+NodeDef('DepthToSpace', 1, 1, blocksize=Required(int), mode='DCR')
 NodeDef('SpaceToDepth', 1, 1, blocksize=Required(int))
 
 NodeDef('Sum', None, 1)
 NodeDef('Mean', None, 1)
 NodeDef('Max', None, 1)
 NodeDef('Min', None, 1)
-NodeDef('Clip', 1, 1, max=float('inf'), min=float('-inf'))
+NodeDef('Clip', (1, 2, 3), 1, max=float('inf'), min=float('-inf'))
+NodeDef('CumSum', 2, 1, exclusive=0, reverse=0)
 
 NodeDef('ReduceSum', 1, 1, axes=[int], keepdims=True)
 NodeDef('ReduceSumSquare', 1, 1, axes=[int], keepdims=True)
@@ -143,6 +158,7 @@ NodeDef('ReduceL1', 1, 1, axes=[int], keepdims=True)
 NodeDef('ReduceL2', 1, 1, axes=[int], keepdims=True)
 NodeDef('ReduceLogSum', 1, 1, axes=[int], keepdims=True)
 NodeDef('ReduceLogSumExp', 1, 1, axes=[int], keepdims=True)
+NodeDef('ReduceProd', 1, 1, axes=[int], keepdims=True)
 
 NodeDef('ArgMax', 1, 1, axis=0, keepdims=True)
 NodeDef('ArgMin', 1, 1, axis=0, keepdims=True)
@@ -151,7 +167,7 @@ NodeDef('Hardmax', 1, 1, axis=1)
 NodeDef('Dropout', 1, (1, 2), ratio=0.5)
 
 NodeDef('MatMul', 2, 1)
-NodeDef('Gemm', 3, 1, alpha=1.0, beta=1.0, transA=False, transB=False)
+NodeDef('Gemm', (2, 3), 1, alpha=1.0, beta=1.0, transA=False, transB=False)
 
 NodeDef('RNN', (3, 4, 5, 6), (0, 1, 2),
         activation_alpha=[float], activation_beta=[float],
@@ -188,26 +204,80 @@ pool_attrs = attr_sets(auto_pad='NOTSET',
                        kernel_shape=Required([int]),
                        pads=[int],
                        storage_order=0,
-                       strides=[int])
+                       strides=[int],
+                       ceil_mode=0)
 # Extension: the third output is for backward context.
-NodeDef('MaxPool', 1, (1, 2, 3), chainer_cover_all=False, **pool_attrs)
+NodeDef('MaxPool', 1, (1, 2, 3), **pool_attrs)
 # Extension: the second output is for backward context.
 NodeDef('AveragePool', 1, (1, 2), count_include_pad=False, **pool_attrs)
 NodeDef('GlobalMaxPool', 1, 1)
 NodeDef('GlobalAveragePool', 1, 1)
-NodeDef('Pad', 1, 1, mode='constant', pads=[int], value=0.0)
-NodeDef('Upsample', 2, 1, mode='nearest')
+# 1 input version is for Pad-2.
+NodeDef('Pad', (1, 2, 3), 1, mode='constant', pads=[int], value=0.0)
+NodeDef('Upsample', (1, 2), 1, mode='nearest',
+        width_scale=float, height_scale=float, scales=[float])
+# TODO(take-cheeze): Handle opset 11 version with (3, 4)
+NodeDef('Resize', (2, 3, 4), 1, mode='nearest')
 
-NodeDef('Softmax', 1, 1, axis=1)
-NodeDef('LogSoftmax', 1, 1, axis=1)
+NodeDef('Softmax', 1, 1, axis=1, chainer_is_onnx_semantics=True)
+NodeDef('LogSoftmax', 1, 1, axis=1, chainer_is_onnx_semantics=True)
 # Extension: it takes N+1 inputs.
 NodeDef('If', None, None, else_branch=Graph, then_branch=Graph)
 NodeDef('Loop', None, None, body=Graph, chainer_stack_axis=0)
-# TODO(hamaji): Fix Scan to handle the new semantics.
-# NodeDef('Scan', None, None, body=Graph, num_scan_inputs=Required(int))
+NodeDef('Scan', None, None, body=Graph,
+        num_scan_inputs=Required(int),
+        scan_input_axes=[int],
+        scan_input_directions=[int],
+        scan_output_axes=[int],
+        scan_output_directions=[int])
+NodeDef('Where', 3, 1)
+NodeDef('TopK', (1, 2), 2, axis=-1, largest=1, sorted=1, k=-1)
+NodeDef('NonMaxSuppression', (2, 3, 4, 5), 1, center_point_box=0)
 
 NodeDef('ImageScaler', 1, 1, scale=1.0, bias_list=[float])
 NodeDef('MaxRoiPool', 2, 1, pooled_shape=Required([int]), spatial_scale=1.0)
+NodeDef('RoiAlign', 3, 1, mode='avg', output_height=1, output_width=1,
+        sampling_ratio=0, spatial_scale=1.0)
+
+NodeDef('QuantizeLinear', (2, 3), 1)
+NodeDef('DequantizeLinear', (2, 3), 1)
+NodeDef('QLinearConv', (8, 9), 1,
+        auto_pad='NOTSET',
+        dilations=[int],
+        group=1,
+        kernel_shape=[int],
+        pads=[int],
+        strides=[int])
+NodeDef('QLinearMatMul', 8, 1)
+NodeDef('MatMulInteger', (2, 3, 4), 1)
+NodeDef('ConvInteger', (2, 3, 4), 1,
+        auto_pad='NOTSET',
+        dilations=[int],
+        group=1,
+        kernel_shape=[int],
+        pads=[int],
+        strides=[int])
+NodeDef('Round', 1, 1)
+NodeDef('BitShift', 2, 1, direction='LEFT')
+NodeDef('NonZero', 1, 1)
+
+# Function nodes definitions
+NodeDef('DynamicQuantizeLinear', 1, 3)
+NodeDef('MeanVarianceNormalization', 1, 1, mvn_axes=[0, 2, 3])
+
+NodeDef('SequenceEmpty', 0, 1, dtype=Dtype)
+NodeDef('SequenceConstruct', None, 1)
+
+NodeDef('SequenceLength', 1, 1)
+
+NodeDef('SequenceInsert', (2, 3), 1)
+NodeDef('SequenceErase', (1, 2), 1)
+
+NodeDef('SequenceAt', 2, 1)
+
+# The second output is for the gradient context.
+NodeDef('ConcatFromSequence', 1, (1, 2), axis=Required(int), new_axis=0)
+NodeDef('SplitToSequence', (1, 2), 1, axis=0, keepdims=True)
 
 NodeDef('ChainerLinear', (2, 3), 1, n_batch_axes=1)
 NodeDef('ChainerLinearGradWeight', 2, 1)
@@ -219,20 +289,22 @@ NodeDef('ChainerROIMaxPool2D', 3, 1,
 NodeDef('ChainerROIAveragePool2D', 3, 1,
         output_shape=[int], spatial_scale=Required(float))
 NodeDef('ChainerROIMaxAlign2D', 3, 1,
-        output_shape=[int], spatial_scale=Required(float), sampling_ratio=[int])
+        output_shape=[int], spatial_scale=Required(float),
+        sampling_ratio_list=[int])
 NodeDef('ChainerROIAverageAlign2D', 3, 1,
-        output_shape=[int], spatial_scale=Required(float), sampling_ratio=[int])
+        output_shape=[int], spatial_scale=Required(float),
+        sampling_ratio_list=[int])
 NodeDef('ChainerResizeImages', 1, 1, output_shape=[int])
+
+NodeDef('ChainerPadBatchSize', 1, 1, size=Required(int))
 
 # For experimental ops.
 NodeDef('ChainerDoSomething', None, None, function_name=Required(str))
 
-NodeDef('ChainerMaxPoolGrad', 2, 1)
-NodeDef('ChainerAveragePoolGrad', 2, 1)
-NodeDef('ChainerMaxPoolGradNoCtx',
-        3, 1, chainer_cover_all=False, **pool_attrs)
-NodeDef('ChainerAveragePoolGradNoCtx',
-        3, 1, count_include_pad=False, **pool_attrs)
+NodeDef('ChainerMaxPoolGrad', 2, 1, **pool_attrs)
+NodeDef('ChainerAveragePoolGrad', 2, 1, count_include_pad=False, **pool_attrs)
+NodeDef('ChainerResizeGrad', 2, 1)
+NodeDef('ChainerBatchNormalizationExpandedStatsShape', 1, 1)
 NodeDef('ChainerBatchNormalizationGrad', 2, 3)
 NodeDef('ChainerConvTransposeWithDynamicOutputShape', 3, 1, **conv_attrs)
 NodeDef('ChainerSoftmaxCrossEntropy', 2, 1)
@@ -243,7 +315,10 @@ NodeDef('ChainerLRNGrad', 4, 1,
 NodeDef('ChainerLSTMGrad', 2, 4)
 NodeDef('ChainerConvGradWeight', 3, 1, **conv_attrs)
 NodeDef('ChainerGatherGrad', 3, 1, axis=0)
+NodeDef('ChainerConcatGrad', None, None, axis=0)
 NodeDef('ChainerDynamicSliceGrad', (4, 5, 6), 1)
+NodeDef('ChainerDtype', 1, 1)
+NodeDef('ChainerDynamicCast', 2, 1)
 NodeDef('ChainerFusionGroup', None, None, subgraph=Graph, fusion_type=str)
 
 # Numpy's advanced indexing.
@@ -265,6 +340,10 @@ NodeDef('ChainerGetItem', None, 1, slice_specs=[int])
 # One more inputs for the shape info.
 NodeDef('ChainerGetItemGrad', None, 1, slice_specs=[int])
 
+# This op takes one more argument in addition to `ChainerGetItem` for the
+# tensor to be set.
+NodeDef('ChainerSetItem', None, 1, slice_specs=[int])
+
 NodeDef('ChainerPrint', None, 0)
 
 # Put a null value.
@@ -273,43 +352,24 @@ NodeDef('ChainerNullConstant', 0, 1)
 # Creates a constant sequence: () -> ([T])
 NodeDef('ChainerSequenceConstants', 0, 1, tensor_values=[Tensor])
 
-# Creates a new sequence: (T...) -> ([T])
-NodeDef('ChainerSequenceCreate', None, 1)
-
-# Appends an element to a sequence: ([T], T) -> ([T])
-NodeDef('ChainerSequenceAppend', 2, 1)
+# Extends a sequence to another sequence: ([T], [T]) -> ([T])
+NodeDef('ChainerSequenceExtend', 2, 1)
 
 # Pops an element from a sequence: ([T]) -> ([T], T)
 NodeDef('ChainerSequencePop', 1, 2)
 
-# Looks up an element in a sequence: ([T], I) -> (T)
-NodeDef('ChainerSequenceLookup', 2, 1)
+# Sets an element to a sequence: ([T], I, T) -> ([T])
+NodeDef('ChainerSequenceUpdate', 3, 1)
 
 # Equivalent to Python's __getitem__ for a slice: ([T], I, I, I) -> ([T])
 NodeDef('ChainerSequenceGetSlice', (1, 2, 3, 4), 1)
 
-# Stacks elements in a sequence: ([T]) -> (T)
-NodeDef('ChainerSequenceStack', 1, 1, axis=0)
-
-# Concatenates elements in a sequence: ([T]) -> (T)
-# The second output is for backward context.
-NodeDef('ChainerSequenceConcat', 1, (1, 2), axis=0)
-
-# Splits a tensor to a sequence (like F.split_axis): (T, I) -> ([T])
-NodeDef('ChainerSequenceSplitAxis', 2, 1, axis=0)
-
 # Pads elements in a sequence: ([T]) -> (T)
 NodeDef('ChainerSequencePad', 1, 1, length=0, value=0.0)
-
-# Splits a tensor to a sequence (like F.separate): (T) -> ([T])
-NodeDef('ChainerSequenceSeparate', 1, 1, axis=0)
 
 # Strips paddings in a tensor and returns a sequence: (T, [I]) -> ([T])
 # Note the result of SequenceLengths can be used as the second argument.
 NodeDef('ChainerSequenceUnpad', 2, 1)
-
-# Returns the number of elements in a sequence: ([T]) -> (I)
-NodeDef('ChainerSequenceSize', 1, 1)
 
 # Returns lengths of elements in a sequence: ([T]) -> ([I])
 NodeDef('ChainerSequenceLengths', 1, 1)
@@ -318,17 +378,17 @@ NodeDef('ChainerSequenceLengths', 1, 1)
 NodeDef('ChainerSequenceRange', (1, 2, 3), 1)
 
 # The gradients of sequence related ops.
-NodeDef('ChainerSequenceLookupGrad', 3, 1)
+NodeDef('ChainerSequenceAtGrad', 3, 1)
 NodeDef('ChainerSequenceGetSliceGrad', (2, 3, 4, 5), 1)
 
 # Equivalent to Python's __len__.
 # For tensors: Gather(Shape(input0), 0)
-# For sequences: ChainerSequenceSize(input0)
+# For sequences: SequenceLength(input0)
 NodeDef('ChainerGenericLen', 1, 1)
 
 # Equivalent to Python's __getitem__ for a scalar index.
 # For tensors: Gather(input0, input1)
-# For sequences: ChainerSequenceLookup(input0, input1)
+# For sequences: SequenceAt(input0, input1)
 # TODO(hamaji): Deprecate this op.
 NodeDef('ChainerGenericGetItem', 2, 1)
 
@@ -354,15 +414,18 @@ NodeDef('ChainerGenericIs', 2, 1)
 # For sequence: Add(i0, i1) for each element in sequences.
 NodeDef('ChainerGenericAccumulateGrad', 2, 1)
 
+ONNX_ATTR_NAME_TABLE = {
+    'tensor_value': 'value',
+    'sampling_ratio_list': 'sampling_ratio',
+    'bias_list': 'bias',
+    'mvn_axes': 'axes',
+}
+
 
 class AttrDef(object):
     def __init__(self, name, value):
         self.name = name
-        self.onnx_name = self.name
-        if self.onnx_name == 'tensor_value':
-            self.onnx_name = 'value'
-        elif self.onnx_name == 'bias_list':
-            self.onnx_name = 'bias'
+        self.onnx_name = ONNX_ATTR_NAME_TABLE[name] if name in ONNX_ATTR_NAME_TABLE else name
         self.c_name = re.sub(r'[A-Z]', lambda m: '_' + m.group(0).lower(), name)
         self.required = False
         self.value = None
@@ -370,8 +433,13 @@ class AttrDef(object):
         if isinstance(value, Required):
             self.required = True
             value = value.v
-        if isinstance(value, list) or isinstance(value, type):
+        self.is_type_only_list = isinstance(value, list) and (len(value) > 0) and isinstance(value[0], type)
+        if self.is_type_only_list or isinstance(value, type):
             self.type = value
+        elif isinstance(value, list):
+            self.type = [type(value[0])]
+            self.value = value
+            assert self.type[0] in (bool, int, str, float, Tensor, Graph)
         else:
             self.type = type(value)
             self.value = value
@@ -543,7 +611,9 @@ def gen_gen_node_base_cc():
         conds.append('str == "%s"' % node.op_type)
         bodies.append(['return k%s;' % node.op_type])
     bodies.append(['CHECK(false) << "Unsupported op_type: " << str;'])
-    lines.extend(codegen_util.cond(conds, bodies))
+
+    lines.extend(codegen_util.cond('goto_label_type', conds, bodies))
+
     lines.append('}')
 
     lines.append('NodeBase::NodeBase(OpType op_type) : op_type_(op_type) {}')
@@ -601,7 +671,11 @@ def gen_gen_node_base_cc():
             'if (!g_permissive) CHECK(false) << "Invalid attribute `"'
             '<< xattr.name() << "\' for " << OpTypeToString(op_type_);',
             'unknown_attributes_.push_back(xattr);'])
-        lines += codegen_util.cond(conds, bodies)
+
+        lines.extend(codegen_util.cond('goto_label_{}'.format(op),
+                                       conds, bodies))
+
+
 
         lines.append('}')
         lines.append('break;')
@@ -730,6 +804,8 @@ def gen_gen_node_base_cc():
                 lines.append('%s_ = "%s";' % (attr.c_name, attr.value))
             elif attr.type == bool:
                 lines.append('%s_ = %s;' % (attr.c_name, str(attr.value).lower()))
+            elif isinstance(attr.type, list):
+                lines.append('%s_ = {%s};' % (attr.c_name, ', '.join([str(v) for v in attr.value])))
             else:
                 lines.append('%s_ = %s;' % (attr.c_name, attr.value))
         lines.append('break;')

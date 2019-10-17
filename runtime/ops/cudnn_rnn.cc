@@ -8,7 +8,8 @@
 #include <cudnn.h>
 
 #include <common/log.h>
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/chainerx_util.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
@@ -161,7 +162,7 @@ int64_t GetRNNWeightOffset(
             pseudo_layer,
             x_desc.descriptor(),
             w_desc.descriptor(),
-            dest_w.raw_data(),
+            RawStartPtr(dest_w),
             lin_layer_id,
             filter_desc.descriptor(),
             &mem);
@@ -182,7 +183,7 @@ int64_t GetRNNWeightOffset(
     CHECK_EQ(param_size, filter_dims[0] * filter_dims[1] * filter_dims[2]);
 #endif
 
-    int64_t offset = (static_cast<char*>(mem) - static_cast<char*>(dest_w.raw_data()));
+    int64_t offset = (static_cast<char*>(mem) - static_cast<char*>(RawStartPtr(dest_w)));
     CHECK(offset % src_w.GetItemSize() == 0) << offset;
     offset /= src_w.GetItemSize();
     return offset;
@@ -206,7 +207,7 @@ void TransposeWeight(const chainerx::Array& w, int pseudo_layer, int hidden_size
     }
 }
 
-class LSTMBackwardContext : public XCVMOpaque {
+class LSTMBackwardContext : public ChxVMOpaque {
 public:
     LSTMBackwardContext(
             std::unique_ptr<CudnnRNNDescriptor>&& rnn_desc,
@@ -227,7 +228,7 @@ public:
             const std::vector<int64_t>& offsets,
             int64_t num_inputs,
             const std::vector<int>& num_batches,
-            bool dump_memory_usage)
+            int dump_memory_usage)
         : rnn_desc_(std::move(rnn_desc)),
           dropout_desc_(std::move(dropout_desc)),
           y_desc_(std::move(y_desc)),
@@ -246,7 +247,7 @@ public:
           offsets_(offsets),
           num_inputs_(num_inputs),
           num_batches_(num_batches) {
-        if (dump_memory_usage) {
+        if (dump_memory_usage >= 1) {
             SetRetainedArrays({y_, w_, h_, c_, x_, workspace_, reserve_});
         }
     }
@@ -346,7 +347,7 @@ chainerx::Array PackSequence(const chainerx::Array& x, int64_t num_inputs, const
         chainerx::Array src = x.At({time, chainerx::Slice(0, num_batch)});
         chainerx::Array dest = packed.At({chainerx::Slice(offset, offset + num_batch)});
         CHECK_EQ(src.GetTotalSize(), dest.GetTotalSize());
-        x.device().Copy(src, dest);
+        BlitArray(src, dest);
         offset += num_batch;
     }
     CHECK_EQ(offset, packed.shape()[0]);
@@ -363,7 +364,7 @@ chainerx::Array UnpackSequence(
         chainerx::Array src = packed.At({chainerx::Slice(offset, offset + num_batch)});
         chainerx::Array dest = x.At({time, chainerx::Slice(0, num_batch)});
         CHECK_EQ(src.GetTotalSize(), dest.GetTotalSize());
-        x.device().Copy(src, dest);
+        BlitArray(src, dest);
         offset += num_batch;
     }
     return x;
@@ -372,18 +373,18 @@ chainerx::Array UnpackSequence(
 }  // namespace
 
 bool CudnnLSTM(
-        XCVMState* st,
+        ChxVMState* st,
         const chainerx::Array& x,
         const chainerx::Array& w,
         const chainerx::Array& r,
-        const nonstd::optional<chainerx::Array>& b,
-        const nonstd::optional<chainerx::Array>& sequence_lens,
-        const nonstd::optional<chainerx::Array>& initial_h,
-        const nonstd::optional<chainerx::Array>& initial_c,
-        const nonstd::optional<chainerx::Array>& p,
+        const absl::optional<chainerx::Array>& b,
+        const absl::optional<chainerx::Array>& sequence_lens,
+        const absl::optional<chainerx::Array>& initial_h,
+        const absl::optional<chainerx::Array>& initial_c,
+        const absl::optional<chainerx::Array>& p,
         int hidden_size,
         int direction,
-        std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, XCVMOpaque*>* result) {
+        std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, ChxVMOpaque*>* result) {
     if (!dynamic_cast<chainerx::cuda::CudaDevice*>(&x.device())) return false;
 
     int64_t seq_length = x.shape()[0];
@@ -428,7 +429,7 @@ bool CudnnLSTM(
     chainerx::Array packed = PackSequence(x, num_inputs, num_batches);
 
     auto& device = dynamic_cast<chainerx::cuda::CudaDevice&>(x.device());
-    CudnnHandle& cudnn_handle = device.cudnn_handle();
+    CudnnHandle& cudnn_handle = chainerx::cuda::cuda_internal::GetDeviceInternals(device).cudnn_handle();
 
     // TODO(hamaji): Avoid unnecessary memory allocation.
     CudnnTensorDescriptor x_desc(chainerx::Empty({batch_size, input_size, 1}, x.dtype(), chainerx::GetNativeBackend().GetDevice(0)));
@@ -472,7 +473,7 @@ bool CudnnLSTM(
                 int64_t param_size = src_w.GetTotalSize();
                 int offset = GetRNNWeightOffset(
                         cudnn_handle, *rnn_desc, pseudo_layer, x_desc, *w_concat_desc, w_concat, lin_layer_id, is_bias, src_w);
-                w_concat.device().Copy(chainerx::Reshape(src_w, {param_size}), w_concat.At({chainerx::Slice(offset, offset + param_size)}));
+                BlitArray(chainerx::Reshape(src_w, {param_size}), w_concat.At({chainerx::Slice(offset, offset + param_size)}));
                 offsets.push_back(offset);
             }
         }
@@ -505,19 +506,19 @@ bool CudnnLSTM(
             cudnnRNNForwardTrainingEx,
             rnn_desc->descriptor(),
             x_rnn_desc->descriptor(),
-            packed.raw_data(),
+            RawStartPtr(packed),
             hc_desc->descriptor(),
             nullptr,  // TODO(hamaji): h
             hc_desc->descriptor(),
             nullptr,  // TODO(hamaji): c
             w_concat_desc->descriptor(),
-            w_concat.raw_data(),
+            RawStartPtr(w_concat),
             y_desc->descriptor(),
-            y.raw_data(),
+            RawStartPtr(y),
             hc_desc->descriptor(),
-            hy.raw_data(),
+            RawStartPtr(hy),
             hc_desc->descriptor(),
-            cy.raw_data(),
+            RawStartPtr(cy),
             nullptr,  // kDesc
             nullptr,  // keys
             nullptr,  // cDesc
@@ -526,12 +527,12 @@ bool CudnnLSTM(
             nullptr,  // iAttn
             nullptr,  // qDesc
             nullptr,  // queries
-            workspace.raw_data(),
+            RawStartPtr(workspace),
             workspace_size,
-            reserve.raw_data(),
+            RawStartPtr(reserve),
             reserve_size);
 
-    XCVMOpaque* context = new LSTMBackwardContext(
+    ChxVMOpaque* context = new LSTMBackwardContext(
             std::move(rnn_desc),
             std::move(dropout_desc),
             std::move(y_desc),
@@ -562,12 +563,12 @@ bool CudnnLSTM(
 
 bool CudnnLSTMGrad(
         const chainerx::Array& ogy,
-        const XCVMOpaque& ctx,
+        const ChxVMOpaque& ctx,
         std::tuple<chainerx::Array, chainerx::Array, chainerx::Array, chainerx::Array>* result) {
     if (!dynamic_cast<const LSTMBackwardContext*>(&ctx)) return false;
     auto& context = dynamic_cast<const LSTMBackwardContext&>(ctx);
     auto& device = dynamic_cast<chainerx::cuda::CudaDevice&>(ogy.device());
-    CudnnHandle& cudnn_handle = device.cudnn_handle();
+    CudnnHandle& cudnn_handle = chainerx::cuda::cuda_internal::GetDeviceInternals(device).cudnn_handle();
 
     const chainerx::Array& x = context.x();
     const chainerx::Array& w_concat = context.w();
@@ -589,9 +590,9 @@ bool CudnnLSTMGrad(
             cudnnRNNBackwardDataEx,
             context.rnn_desc().descriptor(),
             context.y_desc().descriptor(),
-            context.y().raw_data(),
+            RawStartPtr(context.y()),
             context.y_desc().descriptor(),
-            gy.raw_data(),
+            RawStartPtr(gy),
             nullptr,  // dc_desc
             nullptr,  // dc_attn
             context.hc_desc().descriptor(),
@@ -599,38 +600,38 @@ bool CudnnLSTMGrad(
             context.hc_desc().descriptor(),
             nullptr,  // dcy
             context.w_desc().descriptor(),
-            w_concat.raw_data(),
+            RawStartPtr(w_concat),
             context.hc_desc().descriptor(),
             nullptr,  // hx
             context.hc_desc().descriptor(),
             nullptr,  // cx
             context.x_desc().descriptor(),
-            gx.raw_data(),
+            RawStartPtr(gx),
             context.hc_desc().descriptor(),
             nullptr,  // dhx
             context.hc_desc().descriptor(),
             nullptr,  // dcx
             nullptr,  // dk_desc
             nullptr,  // dkeys
-            context.workspace().raw_data(),
+            RawStartPtr(context.workspace()),
             context.workspace().GetNBytes(),
-            context.reserve().raw_data(),
+            RawStartPtr(context.reserve()),
             context.reserve().GetNBytes());
 
     cudnn_handle.Call(
             cudnnRNNBackwardWeightsEx,
             context.rnn_desc().descriptor(),
             context.x_desc().descriptor(),
-            context.x().raw_data(),
+            RawStartPtr(context.x()),
             context.hc_desc().descriptor(),
             nullptr,  // hx
             context.y_desc().descriptor(),
-            context.y().raw_data(),
-            context.workspace().raw_data(),
+            RawStartPtr(context.y()),
+            RawStartPtr(context.workspace()),
             context.workspace().GetNBytes(),
             context.w_desc().descriptor(),
-            gw_concat.raw_data(),
-            context.reserve().raw_data(),
+            RawStartPtr(gw_concat),
+            RawStartPtr(context.reserve()),
             context.reserve().GetNBytes());
 
     gx = UnpackSequence(gx, num_inputs, context.num_batches(), context.x_shape());
@@ -652,8 +653,7 @@ bool CudnnLSTMGrad(
             for (int is_bias = 0; is_bias < 2; ++is_bias) {
                 int64_t offset = context.offsets()[offset_index++];
                 chainerx::Array dest = slices[is_bias][lin_layer_id];
-                gw_concat.device().Copy(
-                        chainerx::Reshape(gw_concat.At({chainerx::Slice(offset, offset + dest.GetTotalSize())}), dest.shape()), dest);
+                BlitArray(chainerx::Reshape(gw_concat.At({chainerx::Slice(offset, offset + dest.GetTotalSize())}), dest.shape()), dest);
             }
         }
     }

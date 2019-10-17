@@ -15,7 +15,8 @@
 
 #endif
 
-#include <runtime/gen_xcvm_ops.h>
+#include <runtime/chainerx_util.h>
+#include <runtime/gen_chxvm_ops.h>
 
 namespace chainer_compiler {
 namespace runtime {
@@ -64,7 +65,7 @@ chainerx::Shape GetShape(const ngraph::Shape& nshape) {
 class NGraphOp::NGraphImpl {
 public:
     std::shared_ptr<ngraph::Function> func;
-    std::unique_ptr<ngraph::runtime::Backend> backend;
+    std::shared_ptr<ngraph::runtime::Backend> backend;
     std::shared_ptr<ngraph::runtime::Executable> handle;
     std::vector<std::shared_ptr<ngraph::runtime::Tensor>> result_tensors;
     std::vector<chainerx::Array> outputs;
@@ -90,9 +91,7 @@ void NGraphOp::InitImpl() {
         }
     }
 
-    // TODO(hamaji): Make this customizable.
-    const char* kBackend = "CPU";
-    impl_->backend = std::move(ngraph::runtime::Backend::create(kBackend));
+    impl_->backend = ngraph::runtime::Backend::create(backend);
 
     impl_->handle = impl_->backend->compile(impl_->func);
 
@@ -101,7 +100,7 @@ void NGraphOp::InitImpl() {
         chainerx::Dtype dtype = GetDtype(result->get_element_type());
         chainerx::Shape shape = GetShape(result->get_shape());
         chainerx::Array array = chainerx::Empty(shape, dtype);
-        impl_->result_tensors.push_back(impl_->backend->create_tensor(result->get_element_type(), result->get_shape(), array.raw_data()));
+        impl_->result_tensors.push_back(impl_->backend->create_tensor(result->get_element_type(), result->get_shape(), RawStartPtr(array)));
         impl_->outputs.push_back(array);
     }
 #endif
@@ -113,21 +112,15 @@ NGraphOp::~NGraphOp() {
 #endif
 }
 
-std::vector<chainerx::Array> NGraphOp::RunImpl(chainer_compiler::runtime::XCVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
+std::vector<chainerx::Array> NGraphOp::RunImpl(chainer_compiler::runtime::ChxVMState* st, const std::vector<chainerx::Array>& orig_inputs) {
 #if CHAINER_COMPILER_ENABLE_NGRAPH
-    CHECK(!inputs.empty());
-
     size_t num_inputs = orig_inputs.size();
 
     // Validate inputs.
     chainerx::Array inputs[num_inputs];
     for (size_t i = 0; i < num_inputs; ++i) {
         const chainerx::Array& input = orig_inputs[i];
-        if (input.IsContiguous()) {
-            inputs[i] = input;
-        } else {
-            inputs[i] = chainerx::Copy(input);
-        }
+        inputs[i] = chainerx::AsContiguous(input);
     }
 
     auto params = impl_->func->get_parameters();
@@ -135,7 +128,7 @@ std::vector<chainerx::Array> NGraphOp::RunImpl(chainer_compiler::runtime::XCVMSt
 
     std::vector<std::shared_ptr<ngraph::runtime::Tensor>> arg_tensors(num_inputs);
     for (size_t i = 0; i < num_inputs; ++i) {
-        auto t = impl_->backend->create_tensor(params.at(i)->get_element_type(), params.at(i)->get_shape(), inputs[i].raw_data());
+        auto t = impl_->backend->create_tensor(params.at(i)->get_element_type(), params.at(i)->get_shape(), RawStartPtr(inputs[i]));
         arg_tensors.at(i) = t;
     }
 

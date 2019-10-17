@@ -14,12 +14,24 @@ namespace chainer_compiler {
 
 namespace {
 
+bool IsConstantNode(const Node* node) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->op_type() != Node::kConstant && node->op_type() != Node::kChainerSequenceConstants) {
+        return false;
+    }
+    // TODO(hamaji): Support constant propagation for string tensors.
+    if (node->op_type() == Node::kConstant && !node->tensor_value()->IsArray()) {
+        return false;
+    }
+    return true;
+}
+
 bool HasConstantInputsOnly(const Node& node) {
     if (node.inputs().empty()) return false;
     for (Value* input : node.inputs()) {
-        if (input->producer() &&
-            (input->producer()->op_type() == Node::kConstant || input->producer()->op_type() == Node::kChainerSequenceConstants)) {
-        } else {
+        if (!IsConstantNode(input->producer())) {
             return false;
         }
     }
@@ -29,7 +41,12 @@ bool HasConstantInputsOnly(const Node& node) {
 void DoConstantPropagation(Graph* graph, Node* node) {
     CLOG() << "Propagate " << node->ToString() << std::endl;
     std::vector<Node*> inputs;
-    for (Value* input : node->inputs()) inputs.push_back(input->producer());
+    std::set<Value*> seen_inputs;
+    for (Value* input : node->inputs()) {
+        if (seen_inputs.insert(input).second) {
+            inputs.push_back(input->producer());
+        }
+    }
 
     std::vector<std::unique_ptr<EvaluatedValue>> next_values;
     std::vector<Node*> nodes = inputs;
@@ -48,7 +65,10 @@ void DoConstantPropagation(Graph* graph, Node* node) {
 
     graph->DetachNode(node);
     for (Node* input : inputs) {
-        if (input->output(0)->users().empty()) {
+        Value* output = input->output(0);
+        // Detach node if the value is not uesd by other ops nor a
+        // graph output.
+        if (output->users().empty() && !output->IsOutput()) {
             graph->DetachNode(input);
         }
     }
@@ -57,24 +77,25 @@ void DoConstantPropagation(Graph* graph, Node* node) {
 bool MaybePropagateConstant(Graph* graph, Node* node) {
     switch (node->op_type()) {
         // TODO(hamaji): Handle more ops.
-        case Node::kIdentity:
         case Node::kAdd:
-        case Node::kSub:
-        case Node::kMul:
-        case Node::kDiv:
+        case Node::kCast:
         case Node::kChainerGenericIs:
         case Node::kChainerGenericLen:
-        case Node::kShape:
-        case Node::kUnsqueeze:
-        case Node::kGather:
-        case Node::kSlice:
+        case Node::kChainerSequenceRange:
+        case Node::kConcat:
+        case Node::kConcatFromSequence:
+        case Node::kDiv:
         case Node::kExpand:
-        case Node::kCast:
-        case Node::kChainerSequenceAppend:
-        case Node::kChainerSequenceConcat:
-        case Node::kChainerSequenceCreate:
-        case Node::kChainerSequenceStack:
-        case Node::kChainerSequenceRange: {
+        case Node::kGather:
+        case Node::kIdentity:
+        case Node::kMul:
+        case Node::kSequenceConstruct:
+        case Node::kSequenceInsert:
+        case Node::kShape:
+        case Node::kSlice:
+        case Node::kSub:
+        case Node::kTranspose:
+        case Node::kUnsqueeze: {
             DoConstantPropagation(graph, node);
             return true;
         }

@@ -1,26 +1,28 @@
 #include "compiler/passes.h"
 
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 
-#include <compiler/config.h>
+#include <compiler/computation_order/core.h>
 #include <compiler/constant_propagation.h>
+#include <compiler/dtype_inference.h>
 #include <compiler/flags.h>
 #include <compiler/flops.h>
 #include <compiler/fusion.h>
 #include <compiler/gradient.h>
+#include <compiler/gradient_with_order.h>
 #include <compiler/graph.h>
 #include <compiler/memory_simulator.h>
+#include <compiler/merge.h>
 #include <compiler/model.h>
+#include <compiler/quantize.h>
 #include <compiler/scheduler.h>
 #include <compiler/shape_evaluator.h>
 #include <compiler/simplifier.h>
 #include <compiler/subgraph_canonicalizer.h>
-#include <compiler/type_inference.h>
-
-#include <compiler/computation_order/core.h>
-#include <compiler/gradient_with_order.h>
+#include <configs/backend_config.h>
 
 namespace chainer_compiler {
 
@@ -33,19 +35,42 @@ void CollectGarbageNode(Graph* graph) {
     graph->DeleteDetached();
 }
 
-void CheckAllOpsSupported(const CompilerConfig& ccfg, Graph* graph) {
-    for (Node* node : graph->nodes()) {
-        CHECK(ccfg.HasOp(node->op_type())) << "Op not supported by backend (" << ccfg.name() << ")\n" << node->DebugString();
-    }
-}
-
-template <class Fn>
-void Recursively(Fn fn, Graph* graph) {
+void Recursively(const std::function<void(Graph*)>& fn, Graph* graph) {
     fn(graph);
     for (const Node* node : graph->nodes()) {
         for (Graph* subgraph : node->GetSubGraphs()) {
             Recursively(fn, subgraph);
         }
+    }
+}
+
+void Recursively(const BackendConfig& bc, Graph* graph, const std::function<void(const BackendConfig&, Graph*)>& fn) {
+    fn(bc, graph);
+
+    for (const Node* node : graph->nodes()) {
+        const std::vector<Graph*>& subgraphs = node->GetSubGraphs();
+        if (subgraphs.empty()) {
+            continue;
+        }
+
+        if (node->op_type() == Node::kChainerFusionGroup) {
+            std::unique_ptr<BackendConfig> backend_config(BackendConfig::FromName(node->fusion_type()));
+            for (Graph* subgraph : node->GetSubGraphs()) {
+                Recursively(*backend_config, subgraph, fn);
+            }
+        } else {
+            for (Graph* subgraph : node->GetSubGraphs()) {
+                Recursively(bc, subgraph, fn);
+            }
+        }
+    }
+}
+
+void CheckAllOpsSupported(const BackendConfig& backend_config, Graph* graph) {
+    for (Node* node : graph->nodes()) {
+        CHECK(backend_config.HasOp(Node::OpTypeToString(node->op_type())))
+                << "Op not supported by backend (" << backend_config.name() << ")\n"
+                << node->DebugString();
     }
 }
 
@@ -55,13 +80,23 @@ void RunDefaultPasses(Model* model, bool gen_backprop) {
     RunDefaultPasses(model->mutable_graph(), gen_backprop);
 }
 
-void RunDefaultPasses(Graph* graph, bool gen_backprop) {
-    // TODO(hamaji): Improve backend selection probably by `CompilerConfig`.
-    g_modify_pool_with_imbalanced_pads = !g_use_ngraph;
+void RunDefaultPasses(Graph* graph, bool gen_backprop, bool skip_scheduling) {
+    std::unique_ptr<BackendConfig> backend_config(BackendConfig::FromName(g_backend_name));
 
-    std::unique_ptr<CompilerConfig> ccfg{GetCompilerConfig(g_backend_name)};
-
-    InferAllDtypeAndShape(graph);
+    if (g_reset_output_shape) {
+        for (Value* value : graph->output_values()) {
+            value->set_type(new Type());
+        }
+    }
+    if (g_reset_shape) {
+        for (const std::unique_ptr<Value>& value : graph->all_values()) {
+            value->set_type(new Type());
+        }
+    }
+    if (!g_skip_inference) {
+        graph->InferShapes();
+        InferAllDtype(graph);
+    }
 
     auto dump_onnx = [&graph](bool cond, const char* msg) {
         if (cond) {
@@ -74,20 +109,38 @@ void RunDefaultPasses(Graph* graph, bool gen_backprop) {
 
     dump_onnx(g_dump_after_inference, "after inference");
 
-    CanonicalizeSubGraphs(graph);
+    if (!skip_scheduling) {
+        CanonicalizeSubGraphs(graph);
 
-    Recursively([&ccfg, gen_backprop](Graph* g) { Simplify(*ccfg, g, gen_backprop); }, graph);
+        Recursively(*backend_config, graph, [gen_backprop](const BackendConfig& bc, Graph* graph) {
+            Simplify(bc, bc.GetSimplifyPreproc(), graph, gen_backprop);
+        });
 
-    Recursively(PropagateConstants, graph);
+        CanonicalizeSubGraphs(graph);
 
-    Recursively(EvaluateShapes, graph);
+        if (g_quantize) {
+            QuantizationOptions q_opts;
+            q_opts.per_channel = !g_disable_per_channel_quantize;
+            Recursively([q_opts](Graph* graph) { Quantize(q_opts, graph); }, graph);
+        }
 
-    Recursively([](Graph* g) { g->DeleteDetached(); }, graph);
+        Recursively(
+                [gen_backprop, &backend_config](Graph* graph) { MergeOperations(backend_config->GetMerge(), graph, gen_backprop); }, graph);
 
-    dump_onnx(g_dump_after_simplification, "after simplification");
+        Recursively(PropagateConstants, graph);
 
-    bool skip_scheduling = false;
+        Recursively(EvaluateShapes, graph);
+
+        Recursively([](Graph* g) { g->DeleteDetached(); }, graph);
+
+        dump_onnx(g_dump_after_simplification, "after simplification");
+    }
+
     if (gen_backprop) {
+        Recursively(*backend_config, graph, [gen_backprop](const BackendConfig& bc, Graph* graph) {
+            Simplify(bc, bc.GetSimplify(), graph, gen_backprop);
+        });
+
         if (g_computation_order.empty()) {
             // normal computation order
             AddGradientNodesForTraining(graph);
@@ -95,8 +148,9 @@ void RunDefaultPasses(Graph* graph, bool gen_backprop) {
             // specified computation order
             skip_scheduling = true;
             auto orders = GetComputationOrder(*graph, g_computation_order);
-            AddGradientNodesForTrainingWithOrders(graph, orders);
-            // SimplifyOps({Node::kIdentity}, graph);
+            if (!AddGradientNodesForTrainingWithOrders(graph, orders)) {
+                CHECK(false) << "Computation order is not supported in this graph.";
+            }
         }
     }
 
@@ -104,7 +158,9 @@ void RunDefaultPasses(Graph* graph, bool gen_backprop) {
     // if (!g_skip_inference) graph->InferShapes();
 
     if (!skip_scheduling) {
-        Recursively([&ccfg, gen_backprop](Graph* g) { Simplify(*ccfg, g, gen_backprop); }, graph);
+        Recursively(*backend_config, graph, [gen_backprop](const BackendConfig& bc, Graph* graph) {
+            Simplify(bc, bc.GetSimplifyPreproc(), graph, gen_backprop);
+        });
 
         Recursively(PropagateConstants, graph);
 
@@ -118,10 +174,18 @@ void RunDefaultPasses(Graph* graph, bool gen_backprop) {
     }
 
     if (!skip_scheduling) {
-        if (g_fuse_operations) {
-            FuseOperations(graph, g_use_tvm, g_use_ngraph);
-            dump_onnx(g_dump_after_fusion, "after fusion");
-        }
+        FuseOperations(graph);
+        dump_onnx(g_dump_after_fusion, "after fusion");
+    }
+
+    if (!skip_scheduling) {
+        Recursively(*backend_config, graph, [gen_backprop](const BackendConfig& bc, Graph* graph) {
+            Simplify(bc, bc.GetSimplify(), graph, gen_backprop);
+        });
+
+        Recursively(PropagateConstants, graph);
+
+        Recursively([](Graph* g) { g->DeleteDetached(); }, graph);
     }
 
     int64_t order = 0;
@@ -136,17 +200,17 @@ void RunDefaultPasses(Graph* graph, bool gen_backprop) {
 
     dump_onnx(g_dump_after_scheduling, "after scheduling");
 
-    Recursively([&ccfg](Graph* g) { CheckAllOpsSupported(*ccfg, g); }, graph);
+    Recursively(*backend_config, graph, CheckAllOpsSupported);
 }
 
 void RunDefaultPassesBeforeGradient(Graph* graph) {
-    std::unique_ptr<CompilerConfig> ccfg{GetCompilerConfig(g_backend_name)};
+    std::unique_ptr<BackendConfig> backend_config(BackendConfig::FromName(g_backend_name));
     graph->InferShapes();
     CanonicalizeSubGraphs(graph);
-    Recursively([&ccfg](Graph* g) { Simplify(*ccfg, g, true); }, graph);
+    Recursively(*backend_config, graph, [](const BackendConfig& bc, Graph* graph) { Simplify(bc, bc.GetSimplify(), graph, true); });
     Recursively(PropagateConstants, graph);
     Recursively([](Graph* g) { g->DeleteDetached(); }, graph);
-    Recursively([&ccfg](Graph* g) { CheckAllOpsSupported(*ccfg, g); }, graph);
+    Recursively(*backend_config, graph, CheckAllOpsSupported);
 }
 
 }  // namespace chainer_compiler

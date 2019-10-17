@@ -1,6 +1,7 @@
 #include "compiler/fusion.h"
 
 #include <limits.h>
+#include <stdio.h>
 
 #include <algorithm>
 #include <functional>
@@ -9,7 +10,9 @@
 #include <stack>
 #include <vector>
 
+#include <common/iterator.h>
 #include <common/strutil.h>
+#include <compiler/flags.h>
 #include <compiler/graph.h>
 #include <compiler/graph_builder.h>
 #include <compiler/node.h>
@@ -19,69 +22,6 @@
 namespace chainer_compiler {
 
 namespace {
-
-void CreateFusionGroup(Graph* graph, const std::set<Node*>& nodes, const std::string& fusion_type, int fusion_group_id) {
-    std::vector<Value*> inputs;
-    std::vector<Value*> outputs;
-    std::vector<Value*> temps;
-    ClassifyValues(std::vector<Node*>(nodes.begin(), nodes.end()), &inputs, &outputs, &temps);
-    CHECK(!inputs.empty());
-    if (outputs.empty()) {
-        return;
-    }
-
-    GraphBuilder gb(graph, StrCat("Fusion", fusion_group_id), outputs.front());
-
-    // TODO(hamaji): Changing input/output values is extremely error
-    // prone. Come up with a better way.
-    auto replace_value = [&nodes](Value* value, Value* new_value) {
-        if (Node* node = value->producer()) {
-            if (nodes.count(node)) {
-                node->ReplaceOutput(value, new_value);
-                value->SetProducer(nullptr);
-                new_value->SetProducer(node);
-            }
-        }
-
-        const std::vector<Node*> users(value->users());  // Take a copy.
-        for (Node* node : users) {
-            if (nodes.count(node)) {
-                node->ReplaceInput(value, new_value);
-                value->DetachUser(node);
-                new_value->AddUser(node);
-            }
-        }
-    };
-
-    Graph* subgraph = new Graph(StrCat("Fusion_", fusion_group_id));
-    for (Value* value : inputs) {
-        Value* new_value = subgraph->AddInputValue("fi_" + value->name(), value->type());
-        replace_value(value, new_value);
-    }
-    for (Value* value : outputs) {
-        Value* new_value = subgraph->AddOutputValue("fo_" + value->name(), value->type());
-        replace_value(value, new_value);
-    }
-    Node* fused = gb.MOp(Node::kChainerFusionGroup, inputs, outputs);
-    graph->MigrateNodes({nodes.begin(), nodes.end()}, temps, subgraph);
-    fused->set_subgraph(subgraph);
-    fused->set_fusion_type(fusion_type);
-    fused->set_chainer_fusion_group(fusion_group_id);
-
-#if 0
-    std::cerr << "Neighbors of " << fused->ToString() << ":" << std::endl;
-    for (Value* v : inputs) {
-        if (v->producer()) {
-            std::cerr << v->producer()->ToString() << std::endl;
-        }
-    }
-    for (Value* v : outputs) {
-        for (Node* n : v->users()) {
-            std::cerr << n->ToString() << std::endl;
-        }
-    }
-#endif
-}
 
 void RejectCyclicNodes(std::set<Node*>* cands) {
     std::stack<Node*> q;
@@ -117,7 +57,113 @@ void RejectCyclicNodes(std::set<Node*>* cands) {
     for (Node* node : rejected) cands->erase(node);
 }
 
-void FuseAllConnectedNodes(const char* name, Graph* graph, int min_fuse_ops, const std::function<bool(const Node&)>& is_fusable) {
+void RejectUnusedConstants(std::set<Node*>* cands) {
+    std::set<Node*> rejected;
+    for (Node* node : *cands) {
+        if (node->op_type() != Node::kConstant) {
+            continue;
+        }
+        bool is_used = false;
+        for (Node* user : node->output(0)->users()) {
+            if (cands->count(user)) {
+                is_used = true;
+                break;
+            }
+        }
+        if (!is_used) {
+            CHECK(rejected.insert(node).second);
+        }
+    }
+
+    for (Node* node : rejected) cands->erase(node);
+}
+
+std::string MakeValueName(const char* prefix, int index, const std::string& name) {
+    CHECK_LT(index, 1000);
+    char buf[12];
+    sprintf(buf, "%03d", index);
+    return StrCat(prefix, buf, "_", name);
+}
+
+}  // namespace
+
+void CreateFusionGroup(
+        Graph* graph, const std::set<Node*>& nodes, const std::string& fusion_type, int fusion_group_id, bool can_fuse_initializers) {
+    std::vector<Value*> inputs;
+    std::vector<Value*> outputs;
+    std::vector<Value*> temps;
+    ClassifyValues(std::vector<Node*>(nodes.begin(), nodes.end()), &inputs, &outputs, &temps);
+    if (inputs.empty() || outputs.empty()) {
+        return;
+    }
+
+    GraphBuilder gb(graph, StrCat("Fusion", fusion_group_id), outputs.front());
+
+    auto replace_value = [&nodes](Value* value, Value* new_value) {
+        if (Node* node = value->producer()) {
+            if (nodes.count(node)) {
+                node->ReplaceOutput(value, new_value);
+            }
+        }
+
+        const std::vector<Node*> users(value->users());  // Take a copy.
+        for (Node* node : users) {
+            if (nodes.count(node)) {
+                node->ReplaceInput(value, new_value);
+            }
+        }
+    };
+
+    auto maybe_fuse_initializer = [&can_fuse_initializers, &fusion_type](Value* value, const std::string& new_name, Value* new_value) {
+        if (!can_fuse_initializers || !value->initializer()) {
+            return false;
+        }
+        new_value->ResetInitializer(std::make_unique<Tensor>(new_name, *value->initializer()));
+        return true;
+    };
+
+    Graph* subgraph = new Graph(StrCat("Fusion_", fusion_group_id));
+    std::vector<Value*> subgraph_inputs;
+    for (const auto& e : Enumerate(inputs)) {
+        Value* value = e.value;
+        const std::string& new_name = MakeValueName("fi", e.index, value->name());
+        Value* new_value = subgraph->AddInputValue(new_name, value->type());
+        replace_value(value, new_value);
+
+        if (!maybe_fuse_initializer(value, new_name, new_value)) {
+            subgraph_inputs.push_back(value);
+        }
+    }
+    for (const auto& e : Enumerate(outputs)) {
+        Value* value = e.value;
+        const std::string& new_name = MakeValueName("fo", e.index, value->name());
+        Value* new_value = subgraph->AddOutputValue(new_name, value->type());
+        replace_value(value, new_value);
+    }
+
+    Node* fused = gb.MOp(Node::kChainerFusionGroup, subgraph_inputs, outputs);
+    graph->MigrateNodes({nodes.begin(), nodes.end()}, temps, subgraph);
+    fused->set_subgraph(subgraph);
+    fused->set_fusion_type(fusion_type);
+    fused->set_chainer_fusion_group(fusion_group_id);
+
+#if 0
+    std::cerr << "Neighbors of " << fused->ToString() << ":" << std::endl;
+    for (Value* v : inputs) {
+        if (v->producer()) {
+            std::cerr << v->producer()->ToString() << std::endl;
+        }
+    }
+    for (Value* v : outputs) {
+        for (Node* n : v->users()) {
+            std::cerr << n->ToString() << std::endl;
+        }
+    }
+#endif
+}
+
+void FuseAllConnectedNodes(
+        const char* name, Graph* graph, int min_fuse_ops, bool can_fuse_initializers, const std::function<bool(const Node&)>& is_fusable) {
     int num_fusion_groups = 0;
     const std::vector<Node*> all_nodes(graph->nodes());
     for (Node* base_node : all_nodes) {
@@ -150,10 +196,11 @@ void FuseAllConnectedNodes(const char* name, Graph* graph, int min_fuse_ops, con
         }
 
         RejectCyclicNodes(&cands);
+        RejectUnusedConstants(&cands);
 
         int num_calculation = 0;
         for (Node* node : cands) {
-            if (node->op_type() != Node::kIdentity && node->op_type() != Node::kConstant) ++num_calculation;
+            if (!node->IsZeroCost()) ++num_calculation;
         }
         if (num_calculation < min_fuse_ops) continue;
 
@@ -162,197 +209,36 @@ void FuseAllConnectedNodes(const char* name, Graph* graph, int min_fuse_ops, con
             node->set_chainer_fusion_group(num_fusion_groups);
         }
 
-        CreateFusionGroup(graph, cands, name, num_fusion_groups);
+        CreateFusionGroup(graph, cands, name, num_fusion_groups, can_fuse_initializers);
     }
 }
 
-void FuseNGraphOperations(Graph* graph) {
-    // TODO(hamaji): Use nGraph for softmax.
-    const std::set<Node::OpType> fusable_ops = {
-            Node::kAdd,
-            Node::kAveragePool,
-            Node::kBatchNormalization,
-            Node::kConstant,
-            Node::kConv,
-            Node::kDiv,
-            Node::kExp,
-            Node::kGemm,
-            Node::kIdentity,
-            Node::kLeakyRelu,
-            // Node::kLogSoftmax,
-            Node::kMaxPool,
-            Node::kMul,
-            Node::kPad,
-            Node::kRelu,
-            Node::kReshape,
-            Node::kSigmoid,
-            Node::kSlice,
-            Node::kSqueeze,
-            // Node::kSoftmax,
-            Node::kSub,
-            Node::kSum,
-            Node::kTanh,
-            Node::kTranspose,
-    };
-
-    auto is_fusable = [&fusable_ops](const Node& node) {
-        if (!fusable_ops.count(node.op_type())) {
-            return false;
-        }
-        for (Value* value : node.inputs()) {
-            if (!value->type().HasKnownShape()) return false;
-        }
-        for (Value* value : node.outputs()) {
-            if (!value->type().HasKnownShape()) return false;
-        }
-
-        if (node.op_type() == Node::kReshape) {
-            CHECK_EQ(2, node.inputs().size());
-            if (!node.input(1)->producer() || node.input(1)->producer()->op_type() != Node::kConstant) {
-                return false;
-            }
-        } else if (node.op_type() == Node::kMaxPool) {
-            if (node.chainer_cover_all()) {
-                return false;
-            }
-        } else if (
-                node.op_type() == Node::kAdd || node.op_type() == Node::kSub || node.op_type() == Node::kMul ||
-                node.op_type() == Node::kDiv || node.op_type() == Node::kPow) {
-            // No type coercion in nGraph.
-            if (node.input(0)->type().dtype() != node.input(1)->type().dtype()) {
-                return false;
-            }
-        } else if (node.op_type() == Node::kPad) {
-            // Apparently, nGraph does not support negative pads.
-            for (int p : node.pads()) {
-                if (p < 0) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    };
-
-    FuseAllConnectedNodes("ngraph", graph, 1, is_fusable);
-}
-
-void FuseTVMOperations(Graph* graph) {
-    auto is_fusable = [](Node* node) {
-        for (Value* value : node->inputs()) {
-            if (value->type().dtype() == Dtype::kInt64) return false;
-            if (!value->type().HasKnownShape()) return false;
-        }
-        for (Value* value : node->outputs()) {
-            if (value->type().dtype() == Dtype::kInt64) return false;
-            if (!value->type().HasKnownShape()) return false;
-        }
-        return true;
-    };
-
-    int num_fusion_groups = 0;
-    std::set<Node*> handled;
-    for (Node* base_node : graph->GetTopologicallySortedNodes()) {
-        if (base_node->op_type() != Node::kRelu && base_node->op_type() != Node::kTanh && base_node->op_type() != Node::kConv &&
-            base_node->op_type() != Node::kConvTranspose) {
-            continue;
-        }
-        if (!handled.emplace(base_node).second) {
-            continue;
-        }
-        if (!is_fusable(base_node)) {
-            continue;
-        }
-
-        std::set<Node*> fused_nodes = {base_node};
-
-        Node* node = base_node;
-        while (true) {
-            CHECK_EQ(1, node->outputs().size());
-            Value* output = node->output(0);
-            if (output->users().size() != 1) {
-                break;
-            }
-
-            Node* user = output->users()[0];
-            if ((user->op_type() != Node::kRelu && user->op_type() != Node::kReduceSum && user->op_type() != Node::kAdd)) {
-                break;
-            }
-            if (!handled.emplace(user).second) {
-                break;
-            }
-            if (!is_fusable(user)) {
-                break;
-            }
-            CHECK(fused_nodes.emplace(user).second);
-            node = user;
-        }
-
-        int num_calculation = 0;
-        for (Node* node : fused_nodes) {
-            if (node->op_type() != Node::kIdentity && node->op_type() != Node::kConstant) ++num_calculation;
-        }
-        if (num_calculation <= 1 && base_node->op_type() != Node::kConv && base_node->op_type() != Node::kConvTranspose) {
-            continue;
-        }
-
-        ++num_fusion_groups;
-        for (Node* node : fused_nodes) {
-            node->set_chainer_fusion_group(num_fusion_groups);
-        }
-        CreateFusionGroup(graph, fused_nodes, "tvm", num_fusion_groups);
-    }
-}
-
-void FuseElementwiseOperations(Graph* graph) {
-    // TODO(hamaji): Do not try fusing integer ops.
-    const std::set<Node::OpType> fusable_ops = {
-            Node::kIdentity,
-            Node::kAdd,
-            Node::kSub,
-            Node::kMul,
-            // Node::kDiv,
-            Node::kTanh,
-            Node::kSigmoid,
-            Node::kExp,
-    };
-
-    auto is_fusable = [&fusable_ops](const Node& node) {
-        if (node.op_type() == Node::kConstant) {
-            Tensor* t = node.tensor_value().get();
-            return t->dtype().IsFloat() && t->NumElements() == 1;
-        }
-
-        if (!fusable_ops.count(node.op_type())) return false;
-        for (Value* value : node.inputs()) {
-            Dtype dtype = value->type().dtype();
-            // TODO(hamaji): Fix the dtype inference and do not fuse
-            // unknown dtypes.
-            if (!dtype.IsFloat() && dtype != Dtype::kUnknown) return false;
-        }
-        return true;
-    };
-
-    FuseAllConnectedNodes("nvrtc", graph, 2, is_fusable);
-}
-
-}  // namespace
-
-void FuseOperations(Graph* graph, bool use_tvm, bool use_ngraph) {
+void FuseOperations(Graph* graph, bool is_subgraph) {
     // Fuse ops in subgraphs first to avoid infinite loop.
     for (const Node* node : graph->nodes()) {
         for (Graph* subgraph : node->GetSubGraphs()) {
-            FuseOperations(subgraph, use_tvm);
+            FuseOperations(subgraph, true);
         }
     }
 
-    if (use_ngraph) {
+    if (g_use_dldt && !is_subgraph) {
+        FuseDldtOperations(graph);
+    }
+    if (g_use_ngraph && !is_subgraph) {
         FuseNGraphOperations(graph);
     }
-    if (use_tvm) {
+    if (g_use_tvm && !is_subgraph) {
         FuseTVMOperations(graph);
     }
-    FuseElementwiseOperations(graph);
+    if (g_use_snpe && !is_subgraph) {
+        FuseSNPEOperations(graph);
+    }
+    if (g_use_tensorrt && !is_subgraph) {
+        FuseTensorRTOperations(graph);
+    }
+    if (g_fuse_operations) {
+        FuseElementwiseOperations(graph);
+    }
 }
 
 }  // namespace chainer_compiler

@@ -1,9 +1,8 @@
 #include "compiler/nvrtc_builder.h"
 
-#include <ctype.h>
-
 #include <algorithm>
 #include <iterator>
+#include <locale>
 #include <map>
 #include <queue>
 #include <set>
@@ -13,6 +12,7 @@
 #include <compiler/code_emitter.h>
 #include <compiler/node.h>
 #include <compiler/tensor.h>
+#include <compiler/type.h>
 #include <compiler/value.h>
 
 namespace chainer_compiler {
@@ -20,9 +20,10 @@ namespace chainer_compiler {
 namespace {
 
 std::string CleanseIdent(const std::string& s, const char* prefix = "v_") {
+    std::locale loc;
     std::string o = prefix;
     for (char c : s) {
-        if (std::isalnum(c)) {
+        if (std::isalnum(c, loc)) {
             o += c;
         } else {
             o += '_';
@@ -94,9 +95,40 @@ void BuildNvrtcProgram(
         seen_ops.insert(node->op_type());
     }
 
+    // TODO(hamaji): Currently, we assume unknown dtype is float32.
+    Dtype dtype = Dtype::kUnknown;
+    for (Node* node : nodes) {
+        for (Value* value : node->inputs()) {
+            Dtype dt = value->type().dtype();
+            if (dt == Dtype::kUnknown) {
+                continue;
+            }
+            if (dtype != Dtype::kUnknown) {
+                CHECK_EQ(dtype, dt);
+            }
+            dtype = dt;
+        }
+    }
+    if (dtype == Dtype::kUnknown) {
+        dtype = Dtype::kFloat32;
+    }
+
     std::ostringstream oss;
     CodeEmitter ce(oss);
-    ce << "typedef float T;\n";
+    switch (dtype) {
+        case Dtype::kFloat16:
+            ce << "typedef half T;\n";
+            break;
+        case Dtype::kFloat32:
+            ce << "typedef float T;\n";
+            break;
+        case Dtype::kFloat64:
+            ce << "typedef double T;\n";
+            break;
+        default:
+            CHECK(false) << "Unknown dtype: " << dtype;
+    }
+
     if (seen_ops.count(Node::kSigmoid)) {
         ce << "__device__ T sigmoid(T x) {\n";
         ce << "const T half = 0.5;\n";
@@ -136,6 +168,9 @@ void BuildNvrtcProgram(
         CHECK_EQ(1, t->NumElements()) << t->dtype();
         double value;
         switch (t->dtype()) {
+            case Dtype::kFloat16:
+                value = static_cast<double>(t->Get<chainerx::Float16>(0));
+                break;
             case Dtype::kFloat32:
                 value = t->Get<float>(0);
                 break;

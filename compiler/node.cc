@@ -13,18 +13,30 @@
 
 namespace chainer_compiler {
 
-Node::Node(const onnx::NodeProto& xnode, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs)
+Node::Node(const onnx::NodeProto& xnode, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs, const std::string& name)
     : NodeBase(xnode, inputs, outputs),
       inputs_(inputs),
       outputs_(outputs),
-      name_(xnode.name()),
+      name_(name.empty() ? xnode.name() : name),
       domain_(xnode.domain()),
       doc_string_(xnode.doc_string()) {
+    // TODO(take-cheeze): Handle Resize-11
+    if (op_type_ == Node::kResize && inputs_.size() == 2) {
+        inputs_.push_back(inputs_[1]);
+    }
     Validate();
+    if (name_.empty() && !outputs.empty()) {
+        name_ = output(0)->name();
+    }
 }
 
-Node::Node(const std::string& name, OpType op_type, const std::vector<Value*>& inputs, const std::vector<Value*>& outputs)
-    : NodeBase(op_type), inputs_(inputs), outputs_(outputs), name_(name) {
+Node::Node(
+        const std::string& name,
+        OpType op_type,
+        const std::vector<Value*>& inputs,
+        const std::vector<Value*>& outputs,
+        const std::string& domain)
+    : NodeBase(op_type), inputs_(inputs), outputs_(outputs), name_(name), domain_(domain) {
     ValidateNumInputsOutputs(inputs, outputs);
     SetDefaultAttributeValues();
 }
@@ -80,8 +92,8 @@ void Node::Validate() const {
         CHECK_EQ(inputs_.size(), else_branch_->input_values().size() + 1) << "Inconsistent number of inputs for If:\n" << DebugString();
         CHECK_EQ(outputs_.size(), then_branch_->output_values().size()) << "Inconsistent number of outputs for If:\n" << DebugString();
         CHECK_EQ(outputs_.size(), else_branch_->output_values().size()) << "Inconsistent number of outputs for If:\n" << DebugString();
-    } else if (op_type_ == Node::kChainerGetItem || op_type_ == Node::kChainerGetItemGrad) {
-        CHECK_LT(0, inputs_.size()) << "ChainerGetItem should have at least 1 inputs:\n" << DebugString();
+    } else if (op_type_ == Node::kChainerGetItem || op_type_ == Node::kChainerGetItemGrad || op_type_ == Node::kChainerSetItem) {
+        CHECK_LT(0, inputs_.size()) << op_type_ << " should have at least 1 inputs:\n" << DebugString();
         CHECK_LT(0, slice_specs().size()) << "ChainerGetItem should have at least 1 slice_specs:\n" << DebugString();
         std::vector<bool> must_be_tensor = {true};
         if (op_type_ == Node::kChainerGetItemGrad) {
@@ -98,7 +110,11 @@ void Node::Validate() const {
                 }
             }
         }
-        CHECK_EQ(must_be_tensor.size(), inputs_.size()) << "Wrong number of inputs for ChainerGetItem:\n" << DebugString();
+        if (op_type_ == Node::kChainerSetItem) {
+            must_be_tensor.push_back(true);
+        }
+
+        CHECK_EQ(must_be_tensor.size(), inputs_.size()) << "Wrong number of inputs for " << op_type_ << ":\n" << DebugString();
         for (size_t i = 0; i < inputs_.size(); ++i) {
             const Value* value = inputs_[i];
             if (must_be_tensor[i]) {
@@ -158,12 +174,16 @@ void Node::ReplaceInput(Value* f, Value* t) {
     auto found = std::find(inputs_.begin(), inputs_.end(), f);
     CHECK(found != inputs_.end());
     *found = t;
+    f->DetachUser(this);
+    t->AddUser(this);
 }
 
 void Node::ReplaceOutput(Value* f, Value* t) {
     auto found = std::find(outputs_.begin(), outputs_.end(), f);
     CHECK(found != outputs_.end());
     *found = t;
+    f->SetProducer(nullptr);
+    t->SetProducer(this);
 }
 
 std::vector<Graph*> Node::GetSubGraphs() const {
@@ -178,6 +198,11 @@ std::vector<Graph*> Node::GetSubGraphs() const {
 bool Node::IsGradNode() const {
     // TODO(hamaji): Implement this in a better way.
     return name_.find("Grad") != std::string::npos;
+}
+
+bool Node::IsZeroCost() const {
+    Node::OpType op = op_type();
+    return op == Node::kIdentity || op == Node::kConstant || op == Node::kReshape;
 }
 
 std::string Node::ToString() const {
